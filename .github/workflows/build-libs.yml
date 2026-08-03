@@ -1,0 +1,440 @@
+name: Release
+
+# Compiles audio.cpp (0xShug0/audio.cpp, pinned by lib/version.txt) + this repo's
+# extern "C" shim into the self-contained shared library the Go binding dlopens,
+# for every (os, arch, backend) variant, and publishes them as per-variant
+# release archives. audio.cpp ships no shared-lib product of its own, so this
+# repo's root CMakeLists.txt builds one: it add_subdirectory()s the pinned
+# checkout, links its STATIC engine_runtime into a SHARED libaudiocpp, and hides
+# everything else (ggml/sentencepiece/absl/protobuf) behind visibility + linker
+# export control. A fail-closed symbol gate (scripts/check-symbols.sh) asserts
+# ONLY the 5 audiocpp_* symbols are exported before anything is published.
+#
+# This is the repo's SINGLE release pipeline: every merge to main builds the
+# matrix and publishes ONE semver release (vX.Y.Z) carrying both the tag (so
+# `go get ...@vX.Y.Z` resolves the binding) AND the prebuilt lib archives +
+# checksums. lib/version.txt selects WHAT is built; the release is named by the
+# binding's own semver.
+#
+# Triggers:
+#   * push to main — routine path; setup computes the next semver from the merged
+#     PR's release: label / commit subject sentinel; the matrix builds; release
+#     tags + publishes. Skipped with "release:skip" / "[skip release]" / "#norelease".
+#   * workflow_dispatch — manual gating run; `only` limits to one variant. Manual
+#     runs NEVER publish.
+#
+# GPU (CUDA/Vulkan) and Windows legs are build+link+symbol-check only — there are
+# no GPU CI runners — and are best-effort (continue-on-error) so a toolchain
+# mismatch can never block a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Limit to one variant id (linux-amd64-cpu | linux-amd64-vulkan | linux-amd64-cuda | linux-arm64-cpu | darwin-arm64-metal | windows-amd64). Empty = full matrix. Manual runs never publish."
+        required: false
+        default: ""
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: read
+
+env:
+  AUDIOCPP_UPSTREAM: 0xShug0/audio.cpp
+  # Turing→Blackwell; Pascal/Volta dropped (matches the worker's CUDA floor).
+  CUDA_ARCHS: "75;80;86;89;90;100;120"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      previous: ${{ steps.v.outputs.previous }}
+      has_previous: ${{ steps.v.outputs.has_previous }}
+      skip: ${{ steps.v.outputs.skip }}
+      pin: ${{ steps.v.outputs.pin }}
+      commit: ${{ steps.v.outputs.commit }}
+      linux_matrix: ${{ steps.m.outputs.linux_matrix }}
+      run_linux: ${{ steps.m.outputs.run_linux }}
+      run_cuda: ${{ steps.m.outputs.run_cuda }}
+      run_macos: ${{ steps.m.outputs.run_macos }}
+      run_windows: ${{ steps.m.outputs.run_windows }}
+      run_full: ${{ steps.m.outputs.run_full }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # lib/version.txt is a bare 40-char audio.cpp commit SHA.
+          pin="$(tr -d '[:space:]' < lib/version.txt)"
+          commit="$pin"
+          echo "pin=$pin"       >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Building upstream $AUDIOCPP_UPSTREAM @ $commit"
+
+          if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Manual run: no version bump (release job won't fire)."
+            exit 0
+          fi
+
+          latest="$(git tag -l --sort=-v:refname \
+                      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+          if [ -z "$latest" ]; then
+            latest="v0.0.0"; has_previous="false"
+          else
+            has_previous="true"
+          fi
+
+          subject="$(git log -1 --pretty=%s "${GITHUB_SHA}")"
+          labels="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                      --jq '.[].labels[].name' 2>/dev/null || true)"
+          has() { printf '%s\n' "$1" | grep -qiF "$2"; }
+
+          if has "$labels" "release:skip" || has "$subject" "[skip release]" || has "$subject" "#norelease"; then
+            echo "Release skip requested."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          if has "$labels" "release:major" || has "$subject" "#major"; then bump="major"
+          elif has "$labels" "release:minor" || has "$subject" "#minor"; then bump="minor"
+          else bump="patch"; fi
+
+          ver="${latest#v}"; IFS='.' read -r major minor patch <<< "$ver"
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          next="v${major}.${minor}.${patch}"
+          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
+            echo "Tag ${next} exists; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "Next version: $next"
+          echo "skip=false"                 >> "$GITHUB_OUTPUT"
+          echo "version=$next"              >> "$GITHUB_OUTPUT"
+          echo "previous=$latest"           >> "$GITHUB_OUTPUT"
+          echo "has_previous=$has_previous" >> "$GITHUB_OUTPUT"
+      - id: m
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          set -euo pipefail
+          linux_all='[
+            {"id":"linux-amd64-cpu","runner":"ubuntu-22.04","arch":"amd64","backend":"cpu"},
+            {"id":"linux-amd64-vulkan","runner":"ubuntu-22.04","arch":"amd64","backend":"vulkan"},
+            {"id":"linux-arm64-cpu","runner":"ubuntu-22.04-arm","arch":"arm64","backend":"cpu"}
+          ]'
+          if [ -n "${ONLY}" ]; then
+            linux_matrix="$(jq -c --arg only "$ONLY" '[.[] | select(.id==$only)]' <<<"$linux_all")"
+          else
+            linux_matrix="$(jq -c . <<<"$linux_all")"
+          fi
+          want() { [ -z "${ONLY}" ] || [ "${ONLY}" = "$1" ]; }
+          echo "linux_matrix=$linux_matrix" >> "$GITHUB_OUTPUT"
+          [ "$linux_matrix" != "[]" ] && echo "run_linux=true" >> "$GITHUB_OUTPUT" || echo "run_linux=false" >> "$GITHUB_OUTPUT"
+          want linux-amd64-cuda   && echo "run_cuda=true"    >> "$GITHUB_OUTPUT" || echo "run_cuda=false"    >> "$GITHUB_OUTPUT"
+          want darwin-arm64-metal && echo "run_macos=true"   >> "$GITHUB_OUTPUT" || echo "run_macos=false"   >> "$GITHUB_OUTPUT"
+          want windows-amd64      && echo "run_windows=true" >> "$GITHUB_OUTPUT" || echo "run_windows=false" >> "$GITHUB_OUTPUT"
+          [ -z "${ONLY}" ] && echo "run_full=true" >> "$GITHUB_OUTPUT" || echo "run_full=false" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Linux host runners — one self-contained libaudiocpp.so per (arch, backend).
+  # The loader opens a single libaudiocpp.so from the lib dir (flat; no per-CPU
+  # subdir), so the CPU build targets an AVX2 baseline (x86-64) / NEON (arm64).
+  # ---------------------------------------------------------------------------
+  linux:
+    needs: setup
+    if: ${{ needs.setup.outputs.run_linux == 'true' && needs.setup.outputs.skip != 'true' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.linux_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git ca-certificates curl
+      - name: Install Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends wget gnupg ca-certificates
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends vulkan-sdk
+      - name: Clone upstream audio.cpp @ pinned commit
+        run: scripts/clone-upstream.sh "https://github.com/${AUDIOCPP_UPSTREAM}.git" "${{ needs.setup.outputs.commit }}" upstream/audio.cpp
+      - name: Configure & build (libaudiocpp)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAUDIOCPP_SRC="$PWD/upstream/audio.cpp" \
+            -DAUDIOCPP_BACKEND=${{ matrix.backend }} \
+            -DAUDIOCPP_MODEL_SET=full
+          cmake --build build --target audiocpp -j
+      - name: Locate library
+        id: lib
+        run: |
+          set -euo pipefail
+          so="$(find build -name 'libaudiocpp.so' -print -quit)"
+          test -n "$so" || { echo "libaudiocpp.so not found"; find build -name '*.so' | sed 's/^/  found: /'; exit 1; }
+          echo "path=$so" >> "$GITHUB_OUTPUT"
+      - name: Verify exported symbols (fail-closed)
+        run: scripts/check-symbols.sh "${{ steps.lib.outputs.path }}"
+      - name: Package archive
+        run: scripts/package-archive.sh "${{ steps.lib.outputs.path }}" "audiocpp-libs-linux-${{ matrix.arch }}-${{ matrix.backend }}.tar.gz" upstream/audio.cpp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.id }}
+          path: audiocpp-libs-*.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux CUDA — inside the matching CUDA devel image. Best-effort: audio.cpp's
+  # CUDA path is unproven in this repo, and Pendra ships Vulkan for NVIDIA-on-*
+  # anyway, so a failure here must never block the release.
+  # ---------------------------------------------------------------------------
+  linux-cuda:
+    needs: setup
+    if: ${{ needs.setup.outputs.run_cuda == 'true' && needs.setup.outputs.skip != 'true' }}
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    container: nvidia/cuda:13.0.0-devel-ubuntu22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tooling
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git ca-certificates curl
+      - name: Clone upstream audio.cpp @ pinned commit
+        run: scripts/clone-upstream.sh "https://github.com/${AUDIOCPP_UPSTREAM}.git" "${{ needs.setup.outputs.commit }}" upstream/audio.cpp
+      - name: Configure & build (libaudiocpp)
+        run: |
+          set -euo pipefail
+          # NCCL is multi-GPU collective comms only; keep it off so the lib has no
+          # hard libnccl NEEDED dep (absent on many otherwise-fine CUDA hosts).
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAUDIOCPP_SRC="$PWD/upstream/audio.cpp" \
+            -DAUDIOCPP_BACKEND=cuda \
+            -DAUDIOCPP_MODEL_SET=full \
+            -DGGML_CUDA_NCCL=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}"
+          cmake --build build --target audiocpp -j
+      - name: Locate library
+        id: lib
+        run: |
+          set -euo pipefail
+          so="$(find build -name 'libaudiocpp.so' -print -quit)"
+          test -n "$so" || { echo "libaudiocpp.so not found"; exit 1; }
+          echo "path=$so" >> "$GITHUB_OUTPUT"
+      - name: Verify exported symbols (fail-closed)
+        run: scripts/check-symbols.sh "${{ steps.lib.outputs.path }}"
+      - name: Verify no NCCL runtime dependency
+        run: |
+          set -euo pipefail
+          if readelf -d "${{ steps.lib.outputs.path }}" | grep -qi 'NEEDED.*libnccl'; then
+            echo "ERROR: libaudiocpp.so links libnccl — rebuild with -DGGML_CUDA_NCCL=OFF" >&2
+            exit 1
+          fi
+          echo "OK: no libnccl NEEDED dependency"
+      - name: Package archive
+        run: scripts/package-archive.sh "${{ steps.lib.outputs.path }}" "audiocpp-libs-linux-amd64-cuda.tar.gz" upstream/audio.cpp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64-cuda
+          path: audiocpp-libs-*.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS — Apple Silicon, Metal. Self-contained dylib (ggml static + hidden).
+  # ---------------------------------------------------------------------------
+  macos:
+    needs: setup
+    if: ${{ needs.setup.outputs.run_macos == 'true' && needs.setup.outputs.skip != 'true' }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tooling
+        run: brew install cmake ninja
+      - name: Clone upstream audio.cpp @ pinned commit
+        run: scripts/clone-upstream.sh "https://github.com/${AUDIOCPP_UPSTREAM}.git" "${{ needs.setup.outputs.commit }}" upstream/audio.cpp
+      - name: Configure & build (libaudiocpp)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAUDIOCPP_SRC="$PWD/upstream/audio.cpp" \
+            -DAUDIOCPP_BACKEND=metal \
+            -DAUDIOCPP_MODEL_SET=full
+          cmake --build build --target audiocpp -j
+      - name: Locate library
+        id: lib
+        run: |
+          set -euo pipefail
+          dylib="$(find build -name 'libaudiocpp.dylib' -print -quit)"
+          test -n "$dylib" || { echo "libaudiocpp.dylib not found"; find build -name '*.dylib' | sed 's/^/  found: /'; exit 1; }
+          echo "path=$dylib" >> "$GITHUB_OUTPUT"
+      - name: Verify exported symbols (fail-closed)
+        run: scripts/check-symbols.sh "${{ steps.lib.outputs.path }}"
+      - name: Package archive
+        run: scripts/package-archive.sh "${{ steps.lib.outputs.path }}" "audiocpp-libs-darwin-arm64-metal.tar.gz" upstream/audio.cpp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-arm64-metal
+          path: audiocpp-libs-*.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows — amd64 CPU. The Go loader is flat (one audiocpp.dll from the lib
+  # dir; no per-CPU subdir tree), so this is a single CPU build with an AVX2
+  # baseline. Best-effort: Windows GPU is served by Vulkan/the CPU build, and a
+  # host/toolchain mismatch must not block a release.
+  # ---------------------------------------------------------------------------
+  windows:
+    needs: setup
+    if: ${{ needs.setup.outputs.run_windows == 'true' && needs.setup.outputs.skip != 'true' }}
+    runs-on: windows-latest
+    continue-on-error: true
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Clone upstream audio.cpp @ pinned commit
+        run: bash scripts/clone-upstream.sh "https://github.com/$env:AUDIOCPP_UPSTREAM.git" "${{ needs.setup.outputs.commit }}" upstream/audio.cpp
+      - name: Configure & build (audiocpp.dll)
+        # Large audio.cpp TUs can exceed MSVC's COFF section limit (C1128); /bigobj
+        # via CXXFLAGS/CFLAGS APPENDS to (not replaces) CMake's MSVC defaults.
+        env:
+          CXXFLAGS: /bigobj
+          CFLAGS: /bigobj
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DAUDIOCPP_SRC="$PWD/upstream/audio.cpp" `
+            -DAUDIOCPP_BACKEND=cpu `
+            -DAUDIOCPP_MODEL_SET=full
+          cmake --build build --target audiocpp -j
+          $dll = Get-ChildItem -Path build -Recurse -Filter "audiocpp.dll" | Select-Object -First 1
+          if (-not $dll) { throw "audiocpp.dll not found" }
+          "path=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        id: lib
+      - name: Verify exported symbols (fail-closed)
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expected = Get-Content lib/expected-symbols.txt | Where-Object { $_.Trim() -ne "" } | ForEach-Object { $_.Trim() }
+          $dump = & dumpbin /EXPORTS "${{ steps.lib.outputs.path }}"
+          $exports = $dump | Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          $fail = $false
+          foreach ($sym in $expected) {
+            if ($exports -notcontains $sym) { Write-Host "MISSING export: $sym"; $fail = $true }
+          }
+          $leaked = $exports | Where-Object { $_ -like 'ggml_*' -or $_ -like 'gguf_*' }
+          if ($leaked) { Write-Host "LEAKED symbols:"; $leaked | ForEach-Object { Write-Host "  $_" }; $fail = $true }
+          if ($fail) { throw "Windows symbol verification FAILED" }
+          Write-Host "Windows symbol verification OK"
+      - name: Package archive
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "stage"; New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "${{ steps.lib.outputs.path }}" $stage/
+          Copy-Item upstream/audio.cpp/LICENSE "$stage/LICENSE.audio.cpp" -ErrorAction SilentlyContinue
+          tar -C $stage -czf "audiocpp-libs-windows-amd64.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-amd64
+          path: audiocpp-libs-*.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Release — gather every archive, checksum, publish the single vX.Y.Z release
+  # (tag so `go get ...@vX.Y.Z` resolves + lib archives as assets). Real merges
+  # only, full build only, not skipped. Mandatory legs (linux, macos) must have
+  # succeeded; GPU/Windows are best-effort and don't gate.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [setup, linux, linux-cuda, macos, windows]
+    if: >-
+      ${{ always() && github.event_name == 'push'
+          && needs.setup.outputs.run_full == 'true'
+          && needs.setup.outputs.skip != 'true'
+          && needs.linux.result == 'success'
+          && needs.macos.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          sha256sum audiocpp-libs-*.tar.gz > checksums.txt
+          cat checksums.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          PREVIOUS: ${{ needs.setup.outputs.previous }}
+          HAS_PREVIOUS: ${{ needs.setup.outputs.has_previous }}
+          PIN: ${{ needs.setup.outputs.pin }}
+          COMMIT: ${{ needs.setup.outputs.commit }}
+        run: |
+          set -euo pipefail
+          notes="$(cat <<EOF
+          audiocpp-go ${VERSION} — pure-Go binding + prebuilt native libraries.
+
+          Built from ${AUDIOCPP_UPSTREAM} @ ${COMMIT} (pin: ${PIN}).
+
+          \`go get github.com/Pendra-Cloud/audiocpp-go@${VERSION}\` for the binding;
+          the lib archives attached here match this exact tag. Each archive contains
+          a self-contained libaudiocpp (ggml + sentencepiece statically linked,
+          hidden visibility — exports only the audiocpp_* symbols the loader
+          registers). CUDA archives require a matching host CUDA runtime; Vulkan
+          archives require a Vulkan loader/ICD on the host.
+          EOF
+          )"
+          pr_body="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                      --jq '.[0].body // ""' 2>/dev/null || true)"
+          [ -n "$pr_body" ] && notes="${notes}"$'\n\n'"${pr_body}"
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist/audiocpp-libs-*.tar.gz dist/checksums.txt --clobber
+          else
+            args=(--target "$GITHUB_SHA" --title "$VERSION" --notes "$notes" --generate-notes)
+            [ "$HAS_PREVIOUS" = "true" ] && args+=(--notes-start-tag "$PREVIOUS")
+            gh release create "$VERSION" dist/audiocpp-libs-*.tar.gz dist/checksums.txt "${args[@]}"
+          fi

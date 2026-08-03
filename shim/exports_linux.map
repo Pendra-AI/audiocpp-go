@@ -1,0 +1,10 @@
+{
+  global:
+    audiocpp_load;
+    audiocpp_synthesize;
+    audiocpp_free_samples;
+    audiocpp_free;
+    audiocpp_version;
+  local:
+    *;
+};

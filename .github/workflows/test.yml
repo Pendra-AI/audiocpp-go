@@ -1,0 +1,44 @@
+name: test
+
+# Fast, hermetic Go checks — no native lib, no GPU. Builds/vets/formats the Go
+# binding and runs the unit tests. The real-lib end-to-end test is env-gated
+# (AUDIOCPP_GO_E2E=1) and deliberately does NOT run here: it needs a built
+# libaudiocpp + a model GGUF, which is what build-libs.yml exercises.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test (hermetic)
+        run: go test ./...
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shell syntax check
+        run: bash -n scripts/clone-upstream.sh scripts/check-symbols.sh scripts/package-archive.sh

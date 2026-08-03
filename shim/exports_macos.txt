@@ -1,0 +1,5 @@
+_audiocpp_load
+_audiocpp_synthesize
+_audiocpp_free_samples
+_audiocpp_free
+_audiocpp_version
