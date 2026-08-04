@@ -34,6 +34,16 @@ set(ENGINE_ENABLE_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
 set(AUDIOCPP_MODEL_SET "custom" CACHE STRING "audio.cpp model set: full|core|custom")
 set(AUDIOCPP_MODELS "qwen3_tts" CACHE STRING "models when AUDIOCPP_MODEL_SET=custom")
 
+# Embed the model-spec JSONs (model_specs/*.json) into the shim so the lib is
+# self-contained. audio.cpp separates a family's compiled kernel from its
+# runtime model-spec descriptor; without this the engine looks for
+# model_specs/<family>.json on disk and aborts with "model spec not found for
+# family 'qwen3_tts'" (there is no such directory beside the shipped lib). ON
+# matches audio.cpp's own `build_*.sh --deployment` and the binding's
+# one-self-contained-lib packaging. FORCE: every build this repo produces is a
+# shipped lib, so it must always embed the specs.
+set(AUDIOCPP_DEPLOYMENT_BUILD ON CACHE BOOL "" FORCE)
+
 # Backend + CPU kernel options, mirroring audio.cpp's own scripts/build_metal.sh.
 set(ENGINE_ENABLE_CUDA OFF CACHE BOOL "" FORCE)
 set(ENGINE_ENABLE_VULKAN OFF CACHE BOOL "" FORCE)
