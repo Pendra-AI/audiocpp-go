@@ -420,7 +420,7 @@ jobs:
 
           Built from ${AUDIOCPP_UPSTREAM} @ ${COMMIT} (pin: ${PIN}).
 
-          \`go get github.com/Pendra-Cloud/audiocpp-go@${VERSION}\` for the binding;
+          \`go get github.com/pendra-ai/audiocpp-go@${VERSION}\` for the binding;
           the lib archives attached here match this exact tag. Each archive contains
           a self-contained libaudiocpp (ggml + sentencepiece statically linked,
           hidden visibility — exports only the audiocpp_* symbols the loader

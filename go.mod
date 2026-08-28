@@ -1,4 +1,4 @@
-module github.com/Pendra-Cloud/audiocpp-go
+module github.com/pendra-ai/audiocpp-go
 
 go 1.24
 
