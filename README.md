@@ -13,7 +13,7 @@ audio.cpp exposes no C API of its own, so this project provides one: a thin `ext
 ## Usage
 
 ```go
-import audiocpp "github.com/Pendra-Cloud/audiocpp-go"
+import audiocpp "github.com/pendra-ai/audiocpp-go"
 
 // Point Load at a directory containing the prebuilt libaudiocpp for your platform.
 if err := audiocpp.Load(libDir); err != nil { log.Fatal(err) }
@@ -60,7 +60,7 @@ AUDIOCPP_GO_E2E=1 go test ./...
 
 ## Prebuilt libraries & releases
 
-`.github/workflows/build-libs.yml` builds a self-contained `libaudiocpp` for each variant — linux amd64 (cpu / cuda / vulkan), linux arm64 (cpu), darwin arm64 (metal), windows amd64 (cpu) — runs the fail-closed symbol gate on each, and publishes one `vX.Y.Z` release carrying the module tag (so `go get github.com/Pendra-Cloud/audiocpp-go@vX.Y.Z` resolves) alongside per-variant `audiocpp-libs-<os>-<arch>-<backend>.tar.gz` archives and `checksums.txt`. GPU and Windows legs are build/link/symbol-check only (no GPU CI runners) and best-effort, so a toolchain mismatch never blocks a release. Consumers extract an archive and pass its directory to `Load(libDir)`.
+`.github/workflows/build-libs.yml` builds a self-contained `libaudiocpp` for each variant — linux amd64 (cpu / cuda / vulkan), linux arm64 (cpu), darwin arm64 (metal), windows amd64 (cpu) — runs the fail-closed symbol gate on each, and publishes one `vX.Y.Z` release carrying the module tag (so `go get github.com/pendra-ai/audiocpp-go@vX.Y.Z` resolves) alongside per-variant `audiocpp-libs-<os>-<arch>-<backend>.tar.gz` archives and `checksums.txt`. GPU and Windows legs are build/link/symbol-check only (no GPU CI runners) and best-effort, so a toolchain mismatch never blocks a release. Consumers extract an archive and pass its directory to `Load(libDir)`.
 
 ## Pin
 

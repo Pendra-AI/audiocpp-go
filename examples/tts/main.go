@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"os"
 
-	audiocpp "github.com/Pendra-Cloud/audiocpp-go"
+	audiocpp "github.com/pendra-ai/audiocpp-go"
 )
 
 func main() {
