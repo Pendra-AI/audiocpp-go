@@ -56,11 +56,11 @@ scripts/check-symbols.sh build/libaudiocpp.dylib
 AUDIOCPP_GO_E2E=1 go test ./...
 ```
 
-`AUDIOCPP_BACKEND` selects the ggml backend (`cpu` / `cuda` / `vulkan` / `hip` / `metal`). `AUDIOCPP_MODEL_SET` defaults to a small set for fast local builds; release builds pass `-DAUDIOCPP_MODEL_SET=full`.
+`AUDIOCPP_BACKEND` selects the ggml backend (`cpu` / `cuda` / `vulkan` / `hip` / `metal`). `AUDIOCPP_NATIVE_CPU` (default `ON`) tunes the CPU kernels for the build machine; pass `-DAUDIOCPP_NATIVE_CPU=OFF` for a library that must run on other CPUs. `AUDIOCPP_MODEL_SET` defaults to a small set for fast local builds; release builds pass `-DAUDIOCPP_MODEL_SET=full`.
 
 ## Prebuilt libraries & releases
 
-`.github/workflows/build-libs.yml` builds a self-contained `libaudiocpp` for each variant — linux amd64 (cpu / cuda / vulkan), linux arm64 (cpu), darwin arm64 (metal), windows amd64 (cpu) — runs the fail-closed symbol gate on each, and publishes one `vX.Y.Z` release carrying the module tag (so `go get github.com/pendra-ai/audiocpp-go@vX.Y.Z` resolves) alongside per-variant `audiocpp-libs-<os>-<arch>-<backend>.tar.gz` archives and `checksums.txt`. GPU and Windows legs are build/link/symbol-check only (no GPU CI runners) and best-effort, so a toolchain mismatch never blocks a release. Consumers extract an archive and pass its directory to `Load(libDir)`.
+`.github/workflows/build-libs.yml` builds a self-contained `libaudiocpp` for each variant — linux amd64 (cpu / cuda / vulkan), linux arm64 (cpu / cuda), darwin arm64 (metal), windows amd64 (cpu) — runs the fail-closed symbol gate on each, and publishes one `vX.Y.Z` release carrying the module tag (so `go get github.com/pendra-ai/audiocpp-go@vX.Y.Z` resolves) alongside per-variant `audiocpp-libs-<os>-<arch>-<backend>.tar.gz` archives and `checksums.txt`. GPU and Windows legs are build/link/symbol-check only (no GPU CI runners). The amd64 CUDA and Windows legs are best-effort, so a toolchain mismatch never blocks a release; the arm64 CUDA leg gates the release. The linux arm64 archives are built with generic CPU flags (`-DAUDIOCPP_NATIVE_CPU=OFF`) so they run on Arm cores other than the CI runner's. The CUDA archives need `libcudart.so.13`, `libcublas.so.13` and `libcufft.so.12` from the host's CUDA 13 runtime. Consumers extract an archive and pass its directory to `Load(libDir)`.
 
 ## Pin
 

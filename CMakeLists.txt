@@ -44,13 +44,22 @@ set(AUDIOCPP_MODELS "qwen3_tts" CACHE STRING "models when AUDIOCPP_MODEL_SET=cus
 # shipped lib, so it must always embed the specs.
 set(AUDIOCPP_DEPLOYMENT_BUILD ON CACHE BOOL "" FORCE)
 
+# CPU kernel tuning. ON compiles ggml's CPU kernels for the BUILD machine's CPU
+# (-march=native / -mcpu=native), so the lib can hit an illegal instruction on a
+# host whose CPU lacks a feature the build machine has. OFF builds the generic
+# baseline for the target arch. Deliberately NOT FORCE-d so -DAUDIOCPP_NATIVE_CPU
+# on the configure line wins; build-libs.yml passes OFF for the linux arm64 legs,
+# whose archives run on other Arm cores (e.g. the DGX Spark's GB10) than the CI
+# runner's.
+set(AUDIOCPP_NATIVE_CPU ON CACHE BOOL "Tune ggml CPU kernels for the build machine's CPU")
+
 # Backend + CPU kernel options, mirroring audio.cpp's own scripts/build_metal.sh.
 set(ENGINE_ENABLE_CUDA OFF CACHE BOOL "" FORCE)
 set(ENGINE_ENABLE_VULKAN OFF CACHE BOOL "" FORCE)
 set(ENGINE_ENABLE_METAL OFF CACHE BOOL "" FORCE)
 set(ENGINE_ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
-set(ENGINE_ENABLE_NATIVE_CPU ON CACHE BOOL "" FORCE)
+set(ENGINE_ENABLE_NATIVE_CPU ${AUDIOCPP_NATIVE_CPU} CACHE BOOL "" FORCE)
 set(ENGINE_ENABLE_LLAMAFILE ON CACHE BOOL "" FORCE)
 if(AUDIOCPP_BACKEND STREQUAL "metal")
   set(ENGINE_ENABLE_METAL ON CACHE BOOL "" FORCE)
