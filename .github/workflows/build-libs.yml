@@ -204,6 +204,17 @@ jobs:
             -DAUDIOCPP_NATIVE_CPU=${{ matrix.native_cpu }} \
             -DAUDIOCPP_MODEL_SET=full
           cmake --build build --target audiocpp -j
+      - name: Verify generic CPU flags (no native tuning)
+        if: matrix.native_cpu == 'OFF'
+        run: |
+          set -euo pipefail
+          # A misspelt -DAUDIOCPP_NATIVE_CPU is only a CMake warning, and no CI
+          # hardware would catch a lib tuned for the runner's CPU, so fail closed.
+          if grep -nE -- '-m(cpu|arch|tune)=native' build/build.ninja | head -n 5 | grep .; then
+            echo "ERROR: build is tuned for the runner's CPU — configure with -DAUDIOCPP_NATIVE_CPU=OFF" >&2
+            exit 1
+          fi
+          echo "OK: no -mcpu/-march/-mtune=native in the build"
       - name: Locate library
         id: lib
         run: |
@@ -324,6 +335,16 @@ jobs:
             -DGGML_CUDA_NCCL=OFF \
             -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS_ARM64}"
           cmake --build build --target audiocpp -j
+      - name: Verify generic CPU flags (no native tuning)
+        run: |
+          set -euo pipefail
+          # A misspelt -DAUDIOCPP_NATIVE_CPU is only a CMake warning, and no CI
+          # hardware would catch a lib tuned for the runner's CPU, so fail closed.
+          if grep -nE -- '-m(cpu|arch|tune)=native' build/build.ninja | head -n 5 | grep .; then
+            echo "ERROR: build is tuned for the runner's CPU — configure with -DAUDIOCPP_NATIVE_CPU=OFF" >&2
+            exit 1
+          fi
+          echo "OK: no -mcpu/-march/-mtune=native in the build"
       - name: Locate library
         id: lib
         run: |
@@ -349,6 +370,8 @@ jobs:
           file "$so" | grep -q 'ELF 64-bit.*aarch64' || { echo "ERROR: $so is not an aarch64 ELF" >&2; exit 1; }
           ls -l "$so"
           readelf -d "$so" | grep NEEDED
+          # No GPU driver on the runner, so libcuda.so.1 is expected "not found".
+          ldd "$so" || true
       - name: Package archive
         run: scripts/package-archive.sh "${{ steps.lib.outputs.path }}" "audiocpp-libs-linux-arm64-cuda.tar.gz" upstream/audio.cpp
       - name: Report archive
