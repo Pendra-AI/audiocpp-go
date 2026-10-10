@@ -210,11 +210,19 @@ jobs:
           set -euo pipefail
           # A misspelt -DAUDIOCPP_NATIVE_CPU is only a CMake warning, and no CI
           # hardware would catch a lib tuned for the runner's CPU, so fail closed.
-          if grep -nE -- '-m(cpu|arch|tune)=native' build/build.ninja | head -n 5 | grep .; then
-            echo "ERROR: build is tuned for the runner's CPU — configure with -DAUDIOCPP_NATIVE_CPU=OFF" >&2
+          # ggml resolves -mcpu=native to the runner's concrete CPU (e.g.
+          # -mcpu=neoverse-n2+sve...) before writing flags, so check the cache
+          # value and reject ANY -mcpu/-march/-mtune in the generated build.
+          grep -qx 'GGML_NATIVE:BOOL=OFF' build/CMakeCache.txt || {
+            echo "ERROR: GGML_NATIVE is not OFF — configure with -DAUDIOCPP_NATIVE_CPU=OFF" >&2
+            grep -n 'NATIVE' build/CMakeCache.txt >&2 || true
+            exit 1
+          }
+          if grep -m5 -nE -- '-m(cpu|arch|tune)=' build/build.ninja; then
+            echo "ERROR: build carries CPU tuning flags — expected the generic arm64 baseline" >&2
             exit 1
           fi
-          echo "OK: no -mcpu/-march/-mtune=native in the build"
+          echo "OK: GGML_NATIVE=OFF and no -mcpu/-march/-mtune in the build"
       - name: Locate library
         id: lib
         run: |
@@ -340,11 +348,19 @@ jobs:
           set -euo pipefail
           # A misspelt -DAUDIOCPP_NATIVE_CPU is only a CMake warning, and no CI
           # hardware would catch a lib tuned for the runner's CPU, so fail closed.
-          if grep -nE -- '-m(cpu|arch|tune)=native' build/build.ninja | head -n 5 | grep .; then
-            echo "ERROR: build is tuned for the runner's CPU — configure with -DAUDIOCPP_NATIVE_CPU=OFF" >&2
+          # ggml resolves -mcpu=native to the runner's concrete CPU (e.g.
+          # -mcpu=neoverse-n2+sve...) before writing flags, so check the cache
+          # value and reject ANY -mcpu/-march/-mtune in the generated build.
+          grep -qx 'GGML_NATIVE:BOOL=OFF' build/CMakeCache.txt || {
+            echo "ERROR: GGML_NATIVE is not OFF — configure with -DAUDIOCPP_NATIVE_CPU=OFF" >&2
+            grep -n 'NATIVE' build/CMakeCache.txt >&2 || true
+            exit 1
+          }
+          if grep -m5 -nE -- '-m(cpu|arch|tune)=' build/build.ninja; then
+            echo "ERROR: build carries CPU tuning flags — expected the generic arm64 baseline" >&2
             exit 1
           fi
-          echo "OK: no -mcpu/-march/-mtune=native in the build"
+          echo "OK: GGML_NATIVE=OFF and no -mcpu/-march/-mtune in the build"
       - name: Locate library
         id: lib
         run: |
