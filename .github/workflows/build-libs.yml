@@ -24,14 +24,16 @@ name: Release
 #     runs NEVER publish.
 #
 # GPU (CUDA/Vulkan) and Windows legs are build+link+symbol-check only — there are
-# no GPU CI runners — and are best-effort (continue-on-error) so a toolchain
-# mismatch can never block a release.
+# no GPU CI runners. The amd64 CUDA and Windows legs are best-effort
+# (continue-on-error) so a toolchain mismatch can never block a release. The
+# arm64 CUDA leg is NOT best-effort: it gates the release, so a release can never
+# be published without the arm64 CUDA archive its consumers pin.
 
 on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Limit to one variant id (linux-amd64-cpu | linux-amd64-vulkan | linux-amd64-cuda | linux-arm64-cpu | darwin-arm64-metal | windows-amd64). Empty = full matrix. Manual runs never publish."
+        description: "Limit to one variant id (linux-amd64-cpu | linux-amd64-vulkan | linux-amd64-cuda | linux-arm64-cpu | linux-arm64-cuda | darwin-arm64-metal | windows-amd64). Empty = full matrix. Manual runs never publish."
         required: false
         default: ""
   push:
@@ -50,6 +52,9 @@ env:
   AUDIOCPP_UPSTREAM: 0xShug0/audio.cpp
   # Turing→Blackwell; Pascal/Volta dropped (matches the worker's CUDA floor).
   CUDA_ARCHS: "75;80;86;89;90;100;120"
+  # linux arm64: Jetson Orin (87) + DGX Spark GB10 (121). 120 alone does not cover
+  # the GB10; ggml rewrites a plain 121 to 121a ("Replacing 121 ... with 121a").
+  CUDA_ARCHS_ARM64: "87;121"
 
 jobs:
   setup:
@@ -64,6 +69,7 @@ jobs:
       linux_matrix: ${{ steps.m.outputs.linux_matrix }}
       run_linux: ${{ steps.m.outputs.run_linux }}
       run_cuda: ${{ steps.m.outputs.run_cuda }}
+      run_cuda_arm64: ${{ steps.m.outputs.run_cuda_arm64 }}
       run_macos: ${{ steps.m.outputs.run_macos }}
       run_windows: ${{ steps.m.outputs.run_windows }}
       run_full: ${{ steps.m.outputs.run_full }}
@@ -134,9 +140,9 @@ jobs:
         run: |
           set -euo pipefail
           linux_all='[
-            {"id":"linux-amd64-cpu","runner":"ubuntu-22.04","arch":"amd64","backend":"cpu"},
-            {"id":"linux-amd64-vulkan","runner":"ubuntu-22.04","arch":"amd64","backend":"vulkan"},
-            {"id":"linux-arm64-cpu","runner":"ubuntu-22.04-arm","arch":"arm64","backend":"cpu"}
+            {"id":"linux-amd64-cpu","runner":"ubuntu-22.04","arch":"amd64","backend":"cpu","native_cpu":"ON"},
+            {"id":"linux-amd64-vulkan","runner":"ubuntu-22.04","arch":"amd64","backend":"vulkan","native_cpu":"ON"},
+            {"id":"linux-arm64-cpu","runner":"ubuntu-22.04-arm","arch":"arm64","backend":"cpu","native_cpu":"OFF"}
           ]'
           if [ -n "${ONLY}" ]; then
             linux_matrix="$(jq -c --arg only "$ONLY" '[.[] | select(.id==$only)]' <<<"$linux_all")"
@@ -147,6 +153,7 @@ jobs:
           echo "linux_matrix=$linux_matrix" >> "$GITHUB_OUTPUT"
           [ "$linux_matrix" != "[]" ] && echo "run_linux=true" >> "$GITHUB_OUTPUT" || echo "run_linux=false" >> "$GITHUB_OUTPUT"
           want linux-amd64-cuda   && echo "run_cuda=true"    >> "$GITHUB_OUTPUT" || echo "run_cuda=false"    >> "$GITHUB_OUTPUT"
+          want linux-arm64-cuda   && echo "run_cuda_arm64=true" >> "$GITHUB_OUTPUT" || echo "run_cuda_arm64=false" >> "$GITHUB_OUTPUT"
           want darwin-arm64-metal && echo "run_macos=true"   >> "$GITHUB_OUTPUT" || echo "run_macos=false"   >> "$GITHUB_OUTPUT"
           want windows-amd64      && echo "run_windows=true" >> "$GITHUB_OUTPUT" || echo "run_windows=false" >> "$GITHUB_OUTPUT"
           [ -z "${ONLY}" ] && echo "run_full=true" >> "$GITHUB_OUTPUT" || echo "run_full=false" >> "$GITHUB_OUTPUT"
@@ -155,6 +162,8 @@ jobs:
   # Linux host runners — one self-contained libaudiocpp.so per (arch, backend).
   # The loader opens a single libaudiocpp.so from the lib dir (flat; no per-CPU
   # subdir), so the CPU build targets an AVX2 baseline (x86-64) / NEON (arm64).
+  # native_cpu=OFF on arm64: the archive runs on other Arm cores than the
+  # runner's, so its CPU kernels must not be tuned -mcpu=native for the runner.
   # ---------------------------------------------------------------------------
   linux:
     needs: setup
@@ -192,8 +201,28 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DAUDIOCPP_SRC="$PWD/upstream/audio.cpp" \
             -DAUDIOCPP_BACKEND=${{ matrix.backend }} \
+            -DAUDIOCPP_NATIVE_CPU=${{ matrix.native_cpu }} \
             -DAUDIOCPP_MODEL_SET=full
           cmake --build build --target audiocpp -j
+      - name: Verify generic CPU flags (no native tuning)
+        if: matrix.native_cpu == 'OFF'
+        run: |
+          set -euo pipefail
+          # A misspelt -DAUDIOCPP_NATIVE_CPU is only a CMake warning, and no CI
+          # hardware would catch a lib tuned for the runner's CPU, so fail closed.
+          # ggml resolves -mcpu=native to the runner's concrete CPU (e.g.
+          # -mcpu=neoverse-n2+sve...) before writing flags, so check the cache
+          # value and reject ANY -mcpu/-march/-mtune in the generated build.
+          grep -qx 'GGML_NATIVE:BOOL=OFF' build/CMakeCache.txt || {
+            echo "ERROR: GGML_NATIVE is not OFF — configure with -DAUDIOCPP_NATIVE_CPU=OFF" >&2
+            grep -n 'NATIVE' build/CMakeCache.txt >&2 || true
+            exit 1
+          }
+          if grep -m5 -nE -- '-m(cpu|arch|tune)=' build/build.ninja; then
+            echo "ERROR: build carries CPU tuning flags — expected the generic arm64 baseline" >&2
+            exit 1
+          fi
+          echo "OK: GGML_NATIVE=OFF and no -mcpu/-march/-mtune in the build"
       - name: Locate library
         id: lib
         run: |
@@ -212,7 +241,7 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Linux CUDA — inside the matching CUDA devel image. Best-effort: audio.cpp's
+  # Linux CUDA (amd64) — inside the matching CUDA devel image. Best-effort: audio.cpp's
   # CUDA path is unproven in this repo, and Pendra ships Vulkan for NVIDIA-on-*
   # anyway, so a failure here must never block the release.
   # ---------------------------------------------------------------------------
@@ -271,6 +300,104 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux-amd64-cuda
+          path: audiocpp-libs-*.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux CUDA (arm64) — the same build on the arm64 runner, for NVIDIA arm64
+  # hosts (DGX Spark, Jetson Orin). Generic CPU kernels (AUDIOCPP_NATIVE_CPU=OFF).
+  # Unlike the amd64 leg this GATES the release (no continue-on-error): consumers
+  # pin this archive, so a release must never be published without it.
+  # The lib needs libcudart.so.13, libcublas.so.13 and libcufft.so.12 at run time.
+  # ---------------------------------------------------------------------------
+  linux-cuda-arm64:
+    needs: setup
+    if: ${{ needs.setup.outputs.run_cuda_arm64 == 'true' && needs.setup.outputs.skip != 'true' }}
+    runs-on: ubuntu-22.04-arm
+    container: nvidia/cuda:13.0.0-devel-ubuntu22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tooling
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git ca-certificates curl file
+      - name: Clone upstream audio.cpp @ pinned commit
+        run: scripts/clone-upstream.sh "https://github.com/${AUDIOCPP_UPSTREAM}.git" "${{ needs.setup.outputs.commit }}" upstream/audio.cpp
+      - name: Configure & build (libaudiocpp)
+        run: |
+          set -euo pipefail
+          # NCCL is multi-GPU collective comms only; keep it off so the lib has no
+          # hard libnccl NEEDED dep (absent on many otherwise-fine CUDA hosts).
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAUDIOCPP_SRC="$PWD/upstream/audio.cpp" \
+            -DAUDIOCPP_BACKEND=cuda \
+            -DAUDIOCPP_NATIVE_CPU=OFF \
+            -DAUDIOCPP_MODEL_SET=full \
+            -DGGML_CUDA_NCCL=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS_ARM64}"
+          cmake --build build --target audiocpp -j
+      - name: Verify generic CPU flags (no native tuning)
+        run: |
+          set -euo pipefail
+          # A misspelt -DAUDIOCPP_NATIVE_CPU is only a CMake warning, and no CI
+          # hardware would catch a lib tuned for the runner's CPU, so fail closed.
+          # ggml resolves -mcpu=native to the runner's concrete CPU (e.g.
+          # -mcpu=neoverse-n2+sve...) before writing flags, so check the cache
+          # value and reject ANY -mcpu/-march/-mtune in the generated build.
+          grep -qx 'GGML_NATIVE:BOOL=OFF' build/CMakeCache.txt || {
+            echo "ERROR: GGML_NATIVE is not OFF — configure with -DAUDIOCPP_NATIVE_CPU=OFF" >&2
+            grep -n 'NATIVE' build/CMakeCache.txt >&2 || true
+            exit 1
+          }
+          if grep -m5 -nE -- '-m(cpu|arch|tune)=' build/build.ninja; then
+            echo "ERROR: build carries CPU tuning flags — expected the generic arm64 baseline" >&2
+            exit 1
+          fi
+          echo "OK: GGML_NATIVE=OFF and no -mcpu/-march/-mtune in the build"
+      - name: Locate library
+        id: lib
+        run: |
+          set -euo pipefail
+          so="$(find build -name 'libaudiocpp.so' -print -quit)"
+          test -n "$so" || { echo "libaudiocpp.so not found"; exit 1; }
+          echo "path=$so" >> "$GITHUB_OUTPUT"
+      - name: Verify exported symbols (fail-closed)
+        run: scripts/check-symbols.sh "${{ steps.lib.outputs.path }}"
+      - name: Verify no NCCL runtime dependency
+        run: |
+          set -euo pipefail
+          if readelf -d "${{ steps.lib.outputs.path }}" | grep -qi 'NEEDED.*libnccl'; then
+            echo "ERROR: libaudiocpp.so links libnccl — rebuild with -DGGML_CUDA_NCCL=OFF" >&2
+            exit 1
+          fi
+          echo "OK: no libnccl NEEDED dependency"
+      - name: Verify aarch64 ELF and report runtime dependencies
+        run: |
+          set -euo pipefail
+          so="${{ steps.lib.outputs.path }}"
+          file "$so"
+          file "$so" | grep -q 'ELF 64-bit.*aarch64' || { echo "ERROR: $so is not an aarch64 ELF" >&2; exit 1; }
+          ls -l "$so"
+          readelf -d "$so" | grep NEEDED
+          # No GPU driver on the runner, so libcuda.so.1 is expected "not found".
+          ldd "$so" || true
+      - name: Package archive
+        run: scripts/package-archive.sh "${{ steps.lib.outputs.path }}" "audiocpp-libs-linux-arm64-cuda.tar.gz" upstream/audio.cpp
+      - name: Report archive
+        run: |
+          set -euo pipefail
+          ls -l audiocpp-libs-linux-arm64-cuda.tar.gz
+          sha256sum audiocpp-libs-linux-arm64-cuda.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-cuda
           path: audiocpp-libs-*.tar.gz
           if-no-files-found: error
 
@@ -380,16 +507,18 @@ jobs:
   # ---------------------------------------------------------------------------
   # Release — gather every archive, checksum, publish the single vX.Y.Z release
   # (tag so `go get ...@vX.Y.Z` resolves + lib archives as assets). Real merges
-  # only, full build only, not skipped. Mandatory legs (linux, macos) must have
-  # succeeded; GPU/Windows are best-effort and don't gate.
+  # only, full build only, not skipped. Mandatory legs (linux, linux-cuda-arm64,
+  # macos) must have succeeded; amd64 CUDA and Windows are best-effort and don't
+  # gate.
   # ---------------------------------------------------------------------------
   release:
-    needs: [setup, linux, linux-cuda, macos, windows]
+    needs: [setup, linux, linux-cuda, linux-cuda-arm64, macos, windows]
     if: >-
       ${{ always() && github.event_name == 'push'
           && needs.setup.outputs.run_full == 'true'
           && needs.setup.outputs.skip != 'true'
           && needs.linux.result == 'success'
+          && needs.linux-cuda-arm64.result == 'success'
           && needs.macos.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
