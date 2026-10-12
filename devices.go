@@ -6,9 +6,9 @@ import (
 )
 
 // ErrDeviceAPIUnavailable is returned by the device functions when the loaded
-// library predates the device registry (shim 0.2.0, release v0.2.0). Such a
-// library still loads and synthesises; only these readings are missing.
-var ErrDeviceAPIUnavailable = errors.New("audiocpp: the loaded library has no device registry (needs v0.2.0 or later)")
+// library predates the device registry (shim 0.2.0). Such a library still loads
+// and synthesises; only these readings are missing.
+var ErrDeviceAPIUnavailable = errors.New("audiocpp: the loaded library has no device registry (needs shim 0.2.0 or later)")
 
 // DeviceType is the kind of a device, mirroring ggml's ggml_backend_dev_type.
 type DeviceType int
@@ -74,7 +74,7 @@ type Memory struct {
 const deviceStringLen = 256
 
 // HasDeviceAPI reports whether the loaded library has the device registry.
-// False before Load, and for a library older than v0.2.0.
+// False before Load, and for a library older than shim 0.2.0.
 func HasDeviceAPI() bool {
 	loadMu.Lock()
 	defer loadMu.Unlock()
@@ -84,7 +84,8 @@ func HasDeviceAPI() bool {
 // Devices lists the devices the library can run a model on, in the library's
 // own order (Devices()[i].Index == i). The list is fixed for the life of the
 // process, so callers may cache it. Safe for concurrent use, including during a
-// Synthesize. Listing does not open any device.
+// Synthesize. Listing runs the backend start-up the first synthesis would run
+// anyway, and does not read from the devices.
 func Devices() (devs []Device, err error) {
 	if !HasDeviceAPI() {
 		return nil, ErrDeviceAPIUnavailable

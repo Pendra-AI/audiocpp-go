@@ -46,7 +46,7 @@ The library links ggml statically and hides it, so nothing outside can see which
 ```go
 devs, err := audiocpp.Devices() // every device, in the library's own order
 if errors.Is(err, audiocpp.ErrDeviceAPIUnavailable) {
-    // libaudiocpp older than v0.2.0: it loads and synthesises, but has no registry.
+    // A libaudiocpp built before the registry: it loads and synthesises without it.
 }
 
 dev, _ := m.Device()                              // the device this model runs on
@@ -58,7 +58,7 @@ footprint := before.FreeBytes - after.FreeBytes   // guard against after > befor
 
 | Call | Returns |
 | --- | --- |
-| `HasDeviceAPI() bool` | Whether the loaded library has the registry (v0.2.0 or later). |
+| `HasDeviceAPI() bool` | Whether the loaded library has the registry (shim 0.2.0 or later, as `Version()` reports). |
 | `Devices() ([]Device, error)` | Every device the library can run on. Fixed for the life of the process. |
 | `DeviceMemory(index int) (Memory, error)` | `FreeBytes` and `TotalBytes` of `Devices()[index]`, read now. |
 | `DeviceID(index int) (string, error)` | The device's PCI bus id (`0000:01:00.0`) on CUDA, ROCm and Vulkan, else `""`. |
@@ -80,7 +80,7 @@ Things to know when measuring with it:
   | Vulkan | This process's heap budget less its use; `FreeBytes == TotalBytes` on a driver without `VK_EXT_memory_budget`. |
   | CPU (in every build) | System memory, with `FreeBytes == TotalBytes` except on Windows, so it cannot show a drop. Measure a CPU model by process RSS. |
 
-- **Cost.** `Devices`, `ResolveDevice` and `(*Model).Device()` only read the registry. `DeviceMemory` and `DeviceID` open the device they are asked about: on CUDA that creates this process's context on that GPU if it has none (a few hundred MB of that card), so read the model's device, not every device. Take the first reading before the window you want to measure, so the context is not counted as the model. A CUDA driver error during a read aborts the process, as it does inside the engine.
+- **Cost.** `Devices`, `ResolveDevice` and `(*Model).Device()` only read the registry (the first call starts the backends, as the first synthesis would). `DeviceMemory` and `DeviceID` open the device they are asked about: on CUDA that creates this process's context on that GPU if it has none (a few hundred MB of that card), so read the model's device, not every device. Take the first reading before the window you want to measure, so the context is not counted as the model. A CUDA driver error during a read aborts the process, as it does inside the engine.
 - **Threading.** All of these are stateless and safe to call from any goroutine, including while a `Synthesize` is running.
 
 ## Building the shared library

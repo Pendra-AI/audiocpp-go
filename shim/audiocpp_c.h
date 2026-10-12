@@ -117,7 +117,9 @@ AUDIOCPP_API const char * audiocpp_version(void);
  * for the life of the process. All four are stateless, need no context, and are
  * safe to call from any thread, including while a synthesis is running.
  *
- * Listing devices does not open them. Reading a device's memory or `id` does:
+ * Listing devices runs the same backend start-up the first synthesis runs, and
+ * no more: it does not read from the devices. Reading a device's memory or
+ * `id` opens it:
  * on CUDA that creates this process's context on that GPU if it has none yet
  * (a few hundred MB of its memory), and a CUDA driver error there aborts the
  * process, as it does inside the engine. So read only the devices you need.
