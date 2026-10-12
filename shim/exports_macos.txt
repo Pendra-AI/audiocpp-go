@@ -3,3 +3,7 @@ _audiocpp_synthesize
 _audiocpp_free_samples
 _audiocpp_free
 _audiocpp_version
+_audiocpp_device_count
+_audiocpp_device_info
+_audiocpp_device_memory
+_audiocpp_resolve_device

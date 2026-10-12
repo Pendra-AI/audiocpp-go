@@ -2,7 +2,7 @@
 // via purego (no cgo) over the extern "C" shim in shim/audiocpp_c.h. It mirrors
 // a common purego binding approach.
 //
-// The surface is deliberately small (five C symbols), so — unlike sd-go, which
+// The surface is deliberately small (nine C symbols), so — unlike sd-go, which
 // splits a ~50-symbol API into pkg/sd + a root layer — the raw bindings and the
 // ergonomic API live in one package here.
 package audiocpp
@@ -23,6 +23,7 @@ const (
 	statusBadArg      = 1
 	statusLoadFailed  = 2
 	statusSynthFailed = 3
+	statusDeviceQuery = 4
 )
 
 // errBufLen is the size of the caller-provided buffer the shim snprintf's its
@@ -44,6 +45,19 @@ var (
 	cFreeSamples func(samples *float32)
 	cFree        func(ctx uintptr)
 	cVersion     func() *byte
+)
+
+// Device-registry bindings (shim 0.2.0+). Optional: they stay nil, and
+// deviceAPI false, when the loaded library predates them.
+var (
+	cDeviceCount func() int32
+	cDeviceInfo  func(index int32, backend *byte, backendLen uintptr, backendIndex *int32,
+		name *byte, nameLen uintptr, description *byte, descriptionLen uintptr,
+		id *byte, idLen uintptr, deviceType *int32) int32
+	cDeviceMemory  func(index int32, freeBytes, totalBytes *uint64) int32
+	cResolveDevice func(backend string, device int32) int32
+
+	deviceAPI bool
 )
 
 // Dynamic library handle, populated by Load.
@@ -122,11 +136,12 @@ func Load(libDir string) (err error) {
 
 	libHandle = handle
 	registerFunctions()
+	deviceAPI = registerDeviceFunctions()
 	loaded = true
 	return nil
 }
 
-// registerFunctions binds the five C symbols. It panics (via RegisterLibFunc) on
+// registerFunctions binds the five core C symbols. It panics (via RegisterLibFunc) on
 // a missing symbol; Load recovers.
 func registerFunctions() {
 	purego.RegisterLibFunc(&cLoad, libHandle, "audiocpp_load")
@@ -134,4 +149,33 @@ func registerFunctions() {
 	purego.RegisterLibFunc(&cFreeSamples, libHandle, "audiocpp_free_samples")
 	purego.RegisterLibFunc(&cFree, libHandle, "audiocpp_free")
 	purego.RegisterLibFunc(&cVersion, libHandle, "audiocpp_version")
+}
+
+// registerDeviceFunctions binds the four device-registry symbols and reports
+// whether the library has them. A library built before shim 0.2.0 lacks them;
+// that is not a load failure, so each symbol is looked up first rather than
+// handed to RegisterLibFunc, which panics on a miss. All four or none: a
+// partial set is treated as absent.
+func registerDeviceFunctions() bool {
+	symbols := []struct {
+		name string
+		fptr any
+	}{
+		{"audiocpp_device_count", &cDeviceCount},
+		{"audiocpp_device_info", &cDeviceInfo},
+		{"audiocpp_device_memory", &cDeviceMemory},
+		{"audiocpp_resolve_device", &cResolveDevice},
+	}
+	addrs := make([]uintptr, len(symbols))
+	for i, s := range symbols {
+		addr, err := lookupSymbol(libHandle, s.name)
+		if err != nil || addr == 0 {
+			return false
+		}
+		addrs[i] = addr
+	}
+	for i, s := range symbols {
+		purego.RegisterFunc(s.fptr, addrs[i])
+	}
+	return true
 }

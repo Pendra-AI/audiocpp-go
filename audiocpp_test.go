@@ -38,6 +38,26 @@ func TestSynthesizeE2E(t *testing.T) {
 	}
 	defer m.Close()
 
+	// Where the model sits, and the device's memory either side of the first
+	// synthesis (the engine allocates on the device there, not at load).
+	dev, err := m.Device()
+	if err != nil {
+		t.Fatalf("Model.Device: %v", err)
+	}
+	before, err := DeviceMemory(dev.Index)
+	if err != nil {
+		t.Fatalf("DeviceMemory(%d): %v", dev.Index, err)
+	}
+	t.Logf("model device: %+v, free before first synthesis: %d of %d", dev, before.FreeBytes, before.TotalBytes)
+	defer func() {
+		after, err := DeviceMemory(dev.Index)
+		if err != nil {
+			t.Errorf("DeviceMemory(%d): %v", dev.Index, err)
+			return
+		}
+		t.Logf("free after first synthesis: %d (drop %d)", after.FreeBytes, int64(before.FreeBytes)-int64(after.FreeBytes))
+	}()
+
 	audio, err := m.Synthesize(SynthParams{
 		Text:    "Binding audio dot cpp from Go with purego.",
 		VoiceID: "ryan",

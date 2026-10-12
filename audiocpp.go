@@ -58,6 +58,10 @@ type Audio struct {
 type Model struct {
 	mu  sync.Mutex
 	ctx uintptr // audiocpp_ctx*; 0 after Close
+
+	// What the model was loaded with; immutable, read by Device.
+	backend string
+	device  int
 }
 
 // New loads a model. The returned Model must be Close()d to free native memory.
@@ -83,7 +87,7 @@ func New(p ModelParams) (m *Model, err error) {
 	if ctx == 0 {
 		return nil, &Error{Code: statusLoadFailed, Msg: cBufString(errBuf)}
 	}
-	return &Model{ctx: ctx}, nil
+	return &Model{ctx: ctx, backend: p.Backend, device: p.Device}, nil
 }
 
 // Synthesize turns text into audio. Safe against a concurrent Close (returns an
