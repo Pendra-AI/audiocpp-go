@@ -514,9 +514,10 @@ jobs:
   # Best-effort: a host/toolchain mismatch must not block a release.
   #
   # The Vulkan library needs only the GPU driver's vulkan-1.dll at run time. The
-  # CUDA library needs cudart64_13.dll, cublas64_13.dll (which loads
-  # cublasLt64_13.dll) and cufft64_12.dll from a CUDA 13 runtime, plus the
-  # driver's nvcuda.dll; the "Report runtime dependencies" step prints the list.
+  # CUDA library needs cublas64_13.dll (which loads cublasLt64_13.dll) from a
+  # CUDA 13 runtime, plus the driver's nvcuda.dll. cufft64_12.dll is delay-loaded
+  # (see CMakeLists.txt): it is needed only by a model that runs the CUDA inverse
+  # STFT. The "Report runtime dependencies" step prints the list.
   # ---------------------------------------------------------------------------
   windows:
     needs: setup
@@ -631,7 +632,9 @@ jobs:
             Select-String -Pattern '^\s+(\S+\.dll)\s*$' | ForEach-Object { $_.Matches[0].Groups[1].Value }
           Write-Host "audiocpp.dll (${{ matrix.backend }}) imports:"; $deps | ForEach-Object { Write-Host "  $_" }
           Get-Item "${{ steps.lib.outputs.path }}" | ForEach-Object { Write-Host "size: $($_.Length) bytes" }
-          $runtime = @{ cpu = @(); vulkan = @("vulkan-1.dll"); cuda = @("cudart64_13.dll", "cublas64_13.dll", "cufft64_12.dll") }
+          # CUDA 13's Windows cudart.lib is a loader stub (it finds the driver's
+          # nvcuda.dll at run time), so a CUDA build has no cudart64_13.dll import.
+          $runtime = @{ cpu = @(); vulkan = @("vulkan-1.dll"); cuda = @("cublas64_13.dll", "cufft64_12.dll") }
           $want = $runtime["${{ matrix.backend }}"]
           $missing = $want | Where-Object { $deps -notcontains $_ }
           if ($missing) { throw "audiocpp.dll does not import: $($missing -join ', ')" }
