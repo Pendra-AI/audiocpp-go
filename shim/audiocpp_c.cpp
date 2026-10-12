@@ -18,9 +18,11 @@
 #include "engine/framework/runtime/registry.h"
 #include "engine/framework/runtime/session.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -111,6 +113,90 @@ void parse_flat_json(const char * json, std::unordered_map<std::string, std::str
         if (i < n && s[i] == ',') { ++i; continue; }
         break;
     }
+}
+
+// --- Device registry -------------------------------------------------------
+
+// Same guard the engine's init_backend runs before it touches the registry.
+void ensure_backends_loaded() {
+    if (ggml_backend_reg_count() == 0) {
+        ggml_backend_load_all();
+    }
+}
+
+ggml_backend_dev_t device_at(int index) {
+    ensure_backends_loaded();
+    if (index < 0 || static_cast<size_t>(index) >= ggml_backend_dev_count()) {
+        return nullptr;
+    }
+    return ggml_backend_dev_get(static_cast<size_t>(index));
+}
+
+int device_index_of(ggml_backend_dev_t device) {
+    if (device == nullptr) {
+        return -1;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_get(i) == device) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void copy_str(char * dst, size_t dstlen, const char * src) {
+    if (dst == nullptr || dstlen == 0) {
+        return;
+    }
+    std::snprintf(dst, dstlen, "%s", src != nullptr ? src : "");
+}
+
+// The ggml registry names behind each engine backend type. Mirrors
+// k_backend_reg_names in audio.cpp's src/framework/core/backend.cpp, which is
+// file-local there; keep the two in step when moving the pin.
+bool reg_name_matches(engine::core::BackendType type, const char * reg_name) {
+    if (reg_name == nullptr) {
+        return false;
+    }
+    const std::string name(reg_name);
+    switch (type) {
+        case engine::core::BackendType::Cuda: return name == "CUDA" || name == "MUSA";
+        case engine::core::BackendType::Hip: return name == "ROCm";
+        case engine::core::BackendType::Vulkan: return name == "Vulkan";
+        case engine::core::BackendType::Metal: return name == "MTL";
+        default: return false;
+    }
+}
+
+// Resolves a backend config to the device init_backend would open for it.
+ggml_backend_dev_t resolve_device(const engine::core::BackendConfig & config) {
+    ensure_backends_loaded();
+    switch (config.type) {
+        case engine::core::BackendType::Cpu:
+            return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        case engine::core::BackendType::BestAvailable: {
+            // ggml_backend_init_best's own order.
+            ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            dev = dev != nullptr ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+            return dev != nullptr ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+        default:
+            break;
+    }
+    if (config.device < 0) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        if (reg == nullptr || !reg_name_matches(config.type, ggml_backend_reg_name(reg))) {
+            continue;
+        }
+        if (static_cast<size_t>(config.device) >= ggml_backend_reg_dev_count(reg)) {
+            return nullptr;
+        }
+        return ggml_backend_reg_dev_get(reg, static_cast<size_t>(config.device));
+    }
+    return nullptr;
 }
 
 }  // namespace
@@ -282,7 +368,94 @@ AUDIOCPP_API void audiocpp_free(audiocpp_ctx * ctx) {
 }
 
 AUDIOCPP_API const char * audiocpp_version(void) {
-    return "audiocpp-go-shim 0.1.0 (audio.cpp pin 545e29a6)";
+    return "audiocpp-go-shim 0.2.0 (audio.cpp pin 545e29a6)";
+}
+
+AUDIOCPP_API int audiocpp_device_count(void) {
+    try {
+        ensure_backends_loaded();
+        return static_cast<int>(ggml_backend_dev_count());
+    } catch (...) {
+        return 0;
+    }
+}
+
+AUDIOCPP_API int audiocpp_device_info(int index,
+                                      char * backend,
+                                      size_t backend_len,
+                                      int * backend_index,
+                                      char * name,
+                                      size_t name_len,
+                                      char * description,
+                                      size_t description_len,
+                                      char * id,
+                                      size_t id_len,
+                                      int * type) {
+    try {
+        ggml_backend_dev_t device = device_at(index);
+        if (device == nullptr) {
+            return AUDIOCPP_ERR_BAD_ARG;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        copy_str(backend, backend_len, reg != nullptr ? ggml_backend_reg_name(reg) : "");
+        if (backend_index != nullptr) {
+            *backend_index = -1;
+            for (size_t i = 0; reg != nullptr && i < ggml_backend_reg_dev_count(reg); ++i) {
+                if (ggml_backend_reg_dev_get(reg, i) == device) {
+                    *backend_index = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        copy_str(name, name_len, ggml_backend_dev_name(device));
+        copy_str(description, description_len, ggml_backend_dev_description(device));
+        if (id != nullptr && id_len > 0) {
+            // The id is only reachable through the props; zeroed first because
+            // backends without one (Metal, CPU) leave the field untouched.
+            ggml_backend_dev_props props = {};
+            ggml_backend_dev_get_props(device, &props);
+            copy_str(id, id_len, props.device_id);
+        }
+        if (type != nullptr) {
+            *type = static_cast<int>(ggml_backend_dev_type(device));
+        }
+        return AUDIOCPP_OK;
+    } catch (...) {
+        return AUDIOCPP_ERR_DEVICE_QUERY_FAILED;
+    }
+}
+
+AUDIOCPP_API int audiocpp_device_memory(int index, uint64_t * free_bytes, uint64_t * total_bytes) {
+    if (free_bytes == nullptr || total_bytes == nullptr) {
+        return AUDIOCPP_ERR_BAD_ARG;
+    }
+    *free_bytes = 0;
+    *total_bytes = 0;
+    try {
+        ggml_backend_dev_t device = device_at(index);
+        if (device == nullptr) {
+            return AUDIOCPP_ERR_BAD_ARG;
+        }
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(device, &free, &total);
+        *free_bytes = static_cast<uint64_t>(free);
+        *total_bytes = static_cast<uint64_t>(total);
+        return AUDIOCPP_OK;
+    } catch (...) {
+        return AUDIOCPP_ERR_DEVICE_QUERY_FAILED;
+    }
+}
+
+AUDIOCPP_API int audiocpp_resolve_device(const char * backend, int device) {
+    try {
+        engine::core::BackendConfig config;
+        config.type = parse_backend(backend != nullptr ? backend : "cpu");
+        config.device = device;
+        return device_index_of(resolve_device(config));
+    } catch (...) {
+        return -1;
+    }
 }
 
 }  // extern "C"

@@ -8,7 +8,8 @@ name: Release
 # checkout, links its STATIC engine_runtime into a SHARED libaudiocpp, and hides
 # everything else (ggml/sentencepiece/absl/protobuf) behind visibility + linker
 # export control. A fail-closed symbol gate (scripts/check-symbols.sh) asserts
-# ONLY the 5 audiocpp_* symbols are exported before anything is published.
+# ONLY the audiocpp_* symbols in lib/expected-symbols.txt are exported before
+# anything is published.
 #
 # This is the repo's SINGLE release pipeline: every merge to main builds the
 # matrix and publishes ONE semver release (vX.Y.Z) carrying both the tag (so
@@ -22,12 +23,18 @@ name: Release
 #     tags + publishes. Skipped with "release:skip" / "[skip release]" / "#norelease".
 #   * workflow_dispatch — manual gating run; `only` limits to one variant. Manual
 #     runs NEVER publish.
+#   * pull_request — the full matrix as a check, for PRs that touch the native
+#     build (the shim, the CMake build, the pin, the scripts, this workflow or the
+#     Go binding the device smoke runs). PR runs NEVER publish.
 #
-# GPU (CUDA/Vulkan) and Windows legs are build+link+symbol-check only — there are
-# no GPU CI runners. The amd64 CUDA and Windows legs are best-effort
-# (continue-on-error) so a toolchain mismatch can never block a release. The
-# arm64 CUDA leg is NOT best-effort: it gates the release, so a release can never
-# be published without the arm64 CUDA archive its consumers pin.
+# Every leg whose library can be opened on its runner (CPU, Vulkan, Metal,
+# Windows) also reads the library's device registry through the Go binding (the
+# env-gated TestDeviceRegistryIntegration; no model needed). The CUDA legs are
+# build+link+symbol-check only — there are no GPU CI runners, and without a
+# driver the CUDA library cannot be opened. The amd64 CUDA and Windows legs are
+# best-effort (continue-on-error) so a toolchain mismatch can never block a
+# release. The arm64 CUDA leg is NOT best-effort: it gates the release, so a
+# release can never be published without the arm64 CUDA archive its consumers pin.
 
 on:
   workflow_dispatch:
@@ -39,10 +46,21 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    paths:
+      - "shim/**"
+      - "lib/**"
+      - "scripts/**"
+      - "CMakeLists.txt"
+      - "*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-libs.yml"
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  # A newer push to a PR supersedes its older check run; a release run never is.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: write
@@ -232,6 +250,20 @@ jobs:
           echo "path=$so" >> "$GITHUB_OUTPUT"
       - name: Verify exported symbols (fail-closed)
         run: scripts/check-symbols.sh "${{ steps.lib.outputs.path }}"
+      # The runner has no Vulkan driver, so the Vulkan leg asserts the CPU device
+      # too: what it proves is that the Vulkan build's registry can be read.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Read the device registry through the Go binding
+        env:
+          AUDIOCPP_GO_DEVICES: "1"
+          AUDIOCPP_GO_EXPECT_BACKEND: CPU
+          AUDIOCPP_GO_RESOLVE_BACKEND: cpu
+        run: |
+          set -euo pipefail
+          AUDIOCPP_GO_LIB_DIR="$(cd "$(dirname "${{ steps.lib.outputs.path }}")" && pwd)" \
+            go test -count=1 -v -run 'TestDeviceRegistryIntegration' .
       - name: Package archive
         run: scripts/package-archive.sh "${{ steps.lib.outputs.path }}" "audiocpp-libs-linux-${{ matrix.arch }}-${{ matrix.backend }}.tar.gz" upstream/audio.cpp
       - uses: actions/upload-artifact@v4
@@ -432,6 +464,18 @@ jobs:
           echo "path=$dylib" >> "$GITHUB_OUTPUT"
       - name: Verify exported symbols (fail-closed)
         run: scripts/check-symbols.sh "${{ steps.lib.outputs.path }}"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Read the device registry through the Go binding
+        env:
+          AUDIOCPP_GO_DEVICES: "1"
+          AUDIOCPP_GO_EXPECT_BACKEND: MTL
+          AUDIOCPP_GO_RESOLVE_BACKEND: metal
+        run: |
+          set -euo pipefail
+          AUDIOCPP_GO_LIB_DIR="$(cd "$(dirname "${{ steps.lib.outputs.path }}")" && pwd)" \
+            go test -count=1 -v -run 'TestDeviceRegistryIntegration' .
       - name: Package archive
         run: scripts/package-archive.sh "${{ steps.lib.outputs.path }}" "audiocpp-libs-darwin-arm64-metal.tar.gz" upstream/audio.cpp
       - uses: actions/upload-artifact@v4
@@ -491,6 +535,19 @@ jobs:
           if ($leaked) { Write-Host "LEAKED symbols:"; $leaked | ForEach-Object { Write-Host "  $_" }; $fail = $true }
           if ($fail) { throw "Windows symbol verification FAILED" }
           Write-Host "Windows symbol verification OK"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Read the device registry through the Go binding
+        env:
+          AUDIOCPP_GO_DEVICES: "1"
+          AUDIOCPP_GO_EXPECT_BACKEND: CPU
+          AUDIOCPP_GO_RESOLVE_BACKEND: cpu
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:AUDIOCPP_GO_LIB_DIR = Split-Path -Parent "${{ steps.lib.outputs.path }}"
+          go test -count=1 -v -run 'TestDeviceRegistryIntegration' .
+          if ($LASTEXITCODE -ne 0) { throw "device registry test FAILED" }
       - name: Package archive
         run: |
           $ErrorActionPreference = "Stop"

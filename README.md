@@ -6,9 +6,9 @@ audio.cpp exposes no C API of its own, so this project provides one: a thin `ext
 
 ## How it works
 
-- **`shim/audiocpp_c.{h,cpp}`** — the `extern "C"` surface (`audiocpp_load` / `audiocpp_synthesize` / `audiocpp_free_samples` / `audiocpp_free` / `audiocpp_version`). It is pointer-only, so it binds cleanly with purego. The shim wraps `make_default_registry → load → create_task_session → prepare → run → AudioBuffer`; the session is created per synthesis and keyed on task (`tts` / `voice_design` / `voice_clone`), so preset voices, voice design and cloning share one loaded model. C++ exceptions never cross the boundary — failures return a status code plus a message string.
-- **`CMakeLists.txt`** — builds audio.cpp's static `engine_runtime` and the shim into a single SHARED `libaudiocpp` with global PIC and hidden visibility, exporting only the five `audiocpp_*` symbols (`-exported_symbols_list` on macOS, `--exclude-libs,ALL` + a version script on Linux) so nothing from ggml/sentencepiece/etc. leaks.
-- **`audiocpp.go` + `binding.go` + `library_{unix,windows}.go`** — the Go binding (package `audiocpp`): `Load(libDir)`, `New(ModelParams)`, `(*Model).Synthesize(SynthParams) → *Audio`, `Close()`, `Version()`, `EncodeWAV()`, and a typed `Error{Code, Msg}`. purego `RegisterLibFunc` binds the five symbols; native PCM is copied into Go memory and then freed, so callers never hold C-owned buffers.
+- **`shim/audiocpp_c.{h,cpp}`** — the `extern "C"` surface (`audiocpp_load` / `audiocpp_synthesize` / `audiocpp_free_samples` / `audiocpp_free` / `audiocpp_version`, plus the device registry: `audiocpp_device_count` / `audiocpp_device_info` / `audiocpp_device_memory` / `audiocpp_resolve_device`). It is pointer-only, so it binds cleanly with purego. The shim wraps `make_default_registry → load → create_task_session → prepare → run → AudioBuffer`; the session is created per synthesis and keyed on task (`tts` / `voice_design` / `voice_clone`), so preset voices, voice design and cloning share one loaded model. C++ exceptions never cross the boundary — failures return a status code plus a message string.
+- **`CMakeLists.txt`** — builds audio.cpp's static `engine_runtime` and the shim into a single SHARED `libaudiocpp` with global PIC and hidden visibility, exporting only the nine `audiocpp_*` symbols (`-exported_symbols_list` on macOS, `--exclude-libs,ALL` + a version script on Linux) so nothing from ggml/sentencepiece/etc. leaks.
+- **`audiocpp.go` + `binding.go` + `library_{unix,windows}.go`** — the Go binding (package `audiocpp`): `Load(libDir)`, `New(ModelParams)`, `(*Model).Synthesize(SynthParams) → *Audio`, `Close()`, `Version()`, `EncodeWAV()`, the device registry (`Devices()`, `DeviceMemory()`, `ResolveDevice()`, `(*Model).Device()`), and a typed `Error{Code, Msg}`. purego binds the nine symbols (the four device ones are optional, so an older library still loads); native PCM is copied into Go memory and then freed, so callers never hold C-owned buffers.
 
 ## Usage
 
@@ -39,6 +39,40 @@ A `Model` is not safe for concurrent use — synthesise serially.
 
 See [`examples/tts`](examples/tts) for a complete runnable example.
 
+## Devices and device memory
+
+The library links ggml statically and hides it, so nothing outside can see which devices it uses or how it numbers them. The device registry exposes that: the library's own device list, each device's free and total memory, and the device a given model runs on. It is what lets a caller attribute a loaded model's memory to the right GPU on a host with several, without `nvidia-smi` (whose GPU indices are not CUDA's).
+
+```go
+devs, err := audiocpp.Devices() // every device, in the library's own order
+if errors.Is(err, audiocpp.ErrDeviceAPIUnavailable) {
+    // libaudiocpp older than v0.2.0: it loads and synthesises, but has no registry.
+}
+
+dev, _ := m.Device()                              // the device this model runs on
+before, _ := audiocpp.DeviceMemory(dev.Index)
+audio, _ := m.Synthesize(params)                  // the first synthesis allocates on the device
+after, _ := audiocpp.DeviceMemory(dev.Index)
+footprint := before.FreeBytes - after.FreeBytes   // guard against after > before
+```
+
+| Call | Returns |
+| --- | --- |
+| `HasDeviceAPI() bool` | Whether the loaded library has the registry (v0.2.0 or later). |
+| `Devices() ([]Device, error)` | Every device the library can run on. Fixed for the life of the process. |
+| `DeviceMemory(index int) (Memory, error)` | `FreeBytes` and `TotalBytes` of `Devices()[index]`, read now. |
+| `ResolveDevice(backend string, device int) (Device, error)` | The device `ModelParams{Backend, Device}` runs on, without loading a model. |
+| `(*Model).Device() (Device, error)` | The same, for a loaded model. |
+
+A `Device` carries `Index` (its position in `Devices()`), `Backend` (ggml's registry name: `CUDA`, `Vulkan`, `MTL`, `ROCm`, `CPU`), `BackendIndex` (the index within that backend, which is what `ModelParams.Device` takes), `Name` (`CUDA0`), `Description` (the hardware name), `ID` (the PCI bus id, e.g. `0000:01:00.0`, on CUDA and Vulkan) and `Type` (`DeviceTypeCPU` / `GPU` / `IGPU` / `Accel` / `Meta`).
+
+Things to know when measuring with it:
+
+- **Numbering.** For CUDA, `BackendIndex` is CUDA's own device ordinal (fastest card first unless `CUDA_DEVICE_ORDER` is set), not `nvidia-smi`'s index. Use `ID` to match a device against another tool's list.
+- **It is a device reading, not a per-model sum.** `DeviceMemory` is device-wide, so a model's share is the drop in `FreeBytes` across its load and its first synthesis (the engine allocates on the device at the first synthesis, not at load). Other processes using the same device move the figure too. audio.cpp does not account its buffers per model, so the library cannot report an exact per-model byte count.
+- **What each backend reports.** CUDA reports the card's memory (on a shared-memory host such as a DGX Spark, the system's available memory) and types every device `GPU`, shared-memory ones included. Metal reports its one device. Vulkan reports each Vulkan device. The CPU device, present in every build, reports system memory with `FreeBytes == TotalBytes` (except on Windows), so it cannot show a drop; measure a CPU model by process RSS.
+- **Cost and threading.** All of these are stateless and safe to call from any goroutine, including while a `Synthesize` is running. `DeviceMemory` is one driver query; `Devices` is a handful. The first call initialises the engine's backends if nothing has yet, which on CUDA creates a context on every visible GPU: take a first reading before the window you want to measure.
+
 ## Building the shared library
 
 ```bash
@@ -52,6 +86,10 @@ cmake --build build --target audiocpp --parallel
 # Verify only the shim's symbols are exported (fail-closed):
 scripts/check-symbols.sh build/libaudiocpp.dylib
 
+# Read the built library's device registry from Go (no model needed):
+AUDIOCPP_GO_DEVICES=1 AUDIOCPP_GO_EXPECT_BACKEND=MTL AUDIOCPP_GO_RESOLVE_BACKEND=metal \
+  go test -run TestDeviceRegistryIntegration .
+
 # Go end-to-end against the local build (needs a model GGUF):
 AUDIOCPP_GO_E2E=1 go test ./...
 ```
@@ -60,7 +98,7 @@ AUDIOCPP_GO_E2E=1 go test ./...
 
 ## Prebuilt libraries & releases
 
-`.github/workflows/build-libs.yml` builds a self-contained `libaudiocpp` for each variant — linux amd64 (cpu / cuda / vulkan), linux arm64 (cpu / cuda), darwin arm64 (metal), windows amd64 (cpu) — runs the fail-closed symbol gate on each, and publishes one `vX.Y.Z` release carrying the module tag (so `go get github.com/pendra-ai/audiocpp-go@vX.Y.Z` resolves) alongside per-variant `audiocpp-libs-<os>-<arch>-<backend>.tar.gz` archives and `checksums.txt`. GPU and Windows legs are build/link/symbol-check only (no GPU CI runners). The amd64 CUDA and Windows legs are best-effort, so a toolchain mismatch never blocks a release; the arm64 CUDA leg gates the release. The linux arm64 archives are built with generic CPU flags (`-DAUDIOCPP_NATIVE_CPU=OFF`) so they run on Arm cores other than the CI runner's. The CUDA archives need `libcudart.so.13`, `libcublas.so.13` and `libcufft.so.12` from the host's CUDA 13 runtime. Consumers extract an archive and pass its directory to `Load(libDir)`.
+`.github/workflows/build-libs.yml` builds a self-contained `libaudiocpp` for each variant — linux amd64 (cpu / cuda / vulkan), linux arm64 (cpu / cuda), darwin arm64 (metal), windows amd64 (cpu) — runs the fail-closed symbol gate on each, and publishes one `vX.Y.Z` release carrying the module tag (so `go get github.com/pendra-ai/audiocpp-go@vX.Y.Z` resolves) alongside per-variant `audiocpp-libs-<os>-<arch>-<backend>.tar.gz` archives and `checksums.txt`. Each leg whose library can be opened on its runner (CPU, Vulkan, Metal, Windows) also reads the device registry through the Go binding; the CUDA legs are build/link/symbol-check only (no GPU CI runners). Pull requests that touch the native build run the same matrix as a check, without publishing. The amd64 CUDA and Windows legs are best-effort, so a toolchain mismatch never blocks a release; the arm64 CUDA leg gates the release. The linux arm64 archives are built with generic CPU flags (`-DAUDIOCPP_NATIVE_CPU=OFF`) so they run on Arm cores other than the CI runner's. The CUDA archives need `libcudart.so.13`, `libcublas.so.13` and `libcufft.so.12` from the host's CUDA 13 runtime. Consumers extract an archive and pass its directory to `Load(libDir)`.
 
 ## Pin
 

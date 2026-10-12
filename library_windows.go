@@ -12,3 +12,7 @@ func openLibrary(name string) (uintptr, error) {
 func closeLibrary(handle uintptr) error {
 	return windows.FreeLibrary(windows.Handle(handle))
 }
+
+func lookupSymbol(handle uintptr, name string) (uintptr, error) {
+	return windows.GetProcAddress(windows.Handle(handle), name)
+}

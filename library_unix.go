@@ -11,3 +11,7 @@ func openLibrary(name string) (uintptr, error) {
 func closeLibrary(handle uintptr) error {
 	return purego.Dlclose(handle)
 }
+
+func lookupSymbol(handle uintptr, name string) (uintptr, error) {
+	return purego.Dlsym(handle, name)
+}
