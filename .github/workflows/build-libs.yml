@@ -28,19 +28,19 @@ name: Release
 #     Go binding the device smoke runs). PR runs NEVER publish.
 #
 # Every leg whose library can be opened on its runner (CPU, Vulkan, Metal,
-# Windows) also reads the library's device registry through the Go binding (the
-# env-gated TestDeviceRegistryIntegration; no model needed). The CUDA legs are
-# build+link+symbol-check only — there are no GPU CI runners, and without a
-# driver the CUDA library cannot be opened. The amd64 CUDA and Windows legs are
-# best-effort (continue-on-error) so a toolchain mismatch can never block a
-# release. The arm64 CUDA leg is NOT best-effort: it gates the release, so a
+# Windows CPU and Vulkan) also reads the library's device registry through the Go
+# binding (the env-gated TestDeviceRegistryIntegration; no model needed). The
+# CUDA legs are build+link+symbol-check only — there are no GPU CI runners, and
+# without a driver the CUDA library cannot be opened. The amd64 CUDA and Windows
+# legs are best-effort (continue-on-error) so a toolchain mismatch can never
+# block a release. The arm64 CUDA leg is NOT best-effort: it gates the release, so a
 # release can never be published without the arm64 CUDA archive its consumers pin.
 
 on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Limit to one variant id (linux-amd64-cpu | linux-amd64-vulkan | linux-amd64-cuda | linux-arm64-cpu | linux-arm64-cuda | darwin-arm64-metal | windows-amd64). Empty = full matrix. Manual runs never publish."
+        description: "Limit to one variant id (linux-amd64-cpu | linux-amd64-vulkan | linux-amd64-cuda | linux-arm64-cpu | linux-arm64-cuda | darwin-arm64-metal | windows-amd64 | windows-amd64-vulkan | windows-amd64-cuda). Empty = full matrix. Manual runs never publish."
         required: false
         default: ""
   push:
@@ -73,6 +73,13 @@ env:
   # linux arm64: Jetson Orin (87) + DGX Spark GB10 (121). 120 alone does not cover
   # the GB10; ggml rewrites a plain 121 to 121a ("Replacing 121 ... with 121a").
   CUDA_ARCHS_ARM64: "87;121"
+  # windows: ggml's own default list for CUDA 13 (what the Windows llama.cpp
+  # CUDA build ships), without the arm64-only 121a. "virtual" is PTX the driver
+  # compiles at first use, "real" is machine code: every card from the worker's
+  # CUDA floor (7.5, Turing) up has one or the other. Each "real" arch is one
+  # more full compile of ggml-cuda on a 4-core runner.
+  CUDA_ARCHS_WINDOWS: "75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real"
+  CUDA_WINDOWS_VERSION: "13.0.0"
 
 jobs:
   setup:
@@ -90,6 +97,7 @@ jobs:
       run_cuda_arm64: ${{ steps.m.outputs.run_cuda_arm64 }}
       run_macos: ${{ steps.m.outputs.run_macos }}
       run_windows: ${{ steps.m.outputs.run_windows }}
+      windows_matrix: ${{ steps.m.outputs.windows_matrix }}
       run_full: ${{ steps.m.outputs.run_full }}
     steps:
       - uses: actions/checkout@v4
@@ -173,7 +181,21 @@ jobs:
           want linux-amd64-cuda   && echo "run_cuda=true"    >> "$GITHUB_OUTPUT" || echo "run_cuda=false"    >> "$GITHUB_OUTPUT"
           want linux-arm64-cuda   && echo "run_cuda_arm64=true" >> "$GITHUB_OUTPUT" || echo "run_cuda_arm64=false" >> "$GITHUB_OUTPUT"
           want darwin-arm64-metal && echo "run_macos=true"   >> "$GITHUB_OUTPUT" || echo "run_macos=false"   >> "$GITHUB_OUTPUT"
-          want windows-amd64      && echo "run_windows=true" >> "$GITHUB_OUTPUT" || echo "run_windows=false" >> "$GITHUB_OUTPUT"
+          # windows-amd64 keeps its unsuffixed name: it is the CPU archive consumers
+          # already pin. The CUDA leg pins windows-2022 so nvcc gets a VS2022 host
+          # compiler it accepts (windows-latest ships a newer MSVC it rejects).
+          windows_all='[
+            {"id":"windows-amd64","runner":"windows-latest","backend":"cpu","archive":"audiocpp-libs-windows-amd64.tar.gz"},
+            {"id":"windows-amd64-vulkan","runner":"windows-latest","backend":"vulkan","archive":"audiocpp-libs-windows-amd64-vulkan.tar.gz"},
+            {"id":"windows-amd64-cuda","runner":"windows-2022","backend":"cuda","archive":"audiocpp-libs-windows-amd64-cuda.tar.gz"}
+          ]'
+          if [ -n "${ONLY}" ]; then
+            windows_matrix="$(jq -c --arg only "$ONLY" '[.[] | select(.id==$only)]' <<<"$windows_all")"
+          else
+            windows_matrix="$(jq -c . <<<"$windows_all")"
+          fi
+          echo "windows_matrix=$windows_matrix" >> "$GITHUB_OUTPUT"
+          [ "$windows_matrix" != "[]" ] && echo "run_windows=true" >> "$GITHUB_OUTPUT" || echo "run_windows=false" >> "$GITHUB_OUTPUT"
           [ -z "${ONLY}" ] && echo "run_full=true" >> "$GITHUB_OUTPUT" || echo "run_full=false" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
@@ -485,25 +507,72 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Windows — amd64 CPU. The Go loader is flat (one audiocpp.dll from the lib
-  # dir; no per-CPU subdir tree), so this is a single CPU build with an AVX2
-  # baseline. Best-effort: Windows GPU is served by Vulkan/the CPU build, and a
-  # host/toolchain mismatch must not block a release.
+  # Windows — amd64, one self-contained audiocpp.dll per backend (cpu, vulkan,
+  # cuda), each in its own archive. The Go loader is flat (one audiocpp.dll from
+  # the lib dir; no per-CPU subdir tree), so every build has generic CPU kernels
+  # (AUDIOCPP_NATIVE_CPU=OFF: ggml's AVX2 baseline, never the runner's own CPU).
+  # Best-effort: a host/toolchain mismatch must not block a release.
+  #
+  # The Vulkan library needs only the GPU driver's vulkan-1.dll at run time. The
+  # CUDA library needs cudart64_13.dll, cublas64_13.dll (which loads
+  # cublasLt64_13.dll) and cufft64_12.dll from a CUDA 13 runtime, plus the
+  # driver's nvcuda.dll; the "Report runtime dependencies" step prints the list.
   # ---------------------------------------------------------------------------
   windows:
     needs: setup
     if: ${{ needs.setup.outputs.run_windows == 'true' && needs.setup.outputs.skip != 'true' }}
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.windows_matrix) }}
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Resolve the latest published Windows SDK version rather than pinning a
+          # string that may not exist for Windows (a hardcoded version 404s).
+          $ver = (Invoke-WebRequest -Uri "https://vulkan.lunarg.com/sdk/latest/windows.txt").Content.Trim()
+          Write-Host "Latest Vulkan SDK for Windows: $ver"
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
+          Invoke-WebRequest -Uri $url -OutFile vulkan-installer.exe
+          Start-Process -FilePath .\vulkan-installer.exe -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait
+          "VULKAN_SDK=C:\VulkanSDK\$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\VulkanSDK\$ver\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Install CUDA toolkit
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_WINDOWS_VERSION }}
+          method: network
+          # The action validates a non-existent cache path on network installs
+          # and aborts with "Path Validation Error" unless caching is disabled.
+          use-github-cache: false
+          use-local-cache: false
+          # CUDA 13 split the compiler: cuda_runtime.h includes crt/host_config.h
+          # from the separate "crt" component and nvcc's cicc lives in "nvvm".
+          # The installer silently ignores a name it does not know, so the next
+          # step checks the headers and import libraries really landed.
+          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "cuda_profiler_api"]'
+      - name: Verify the CUDA toolkit components
+        if: matrix.backend == 'cuda'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $need = @("include\crt\host_config.h", "include\cublas_v2.h", "include\cufft.h",
+                    "lib\x64\cudart.lib", "lib\x64\cublas.lib", "lib\x64\cufft.lib", "nvvm\bin\cicc.exe")
+          $missing = $need | Where-Object { -not (Test-Path (Join-Path $env:CUDA_PATH $_)) }
+          if ($missing) { throw "CUDA toolkit at $env:CUDA_PATH is missing: $($missing -join ', ')" }
+          Write-Host "CUDA toolkit OK at $env:CUDA_PATH"
       - name: Clone upstream audio.cpp @ pinned commit
         run: bash scripts/clone-upstream.sh "https://github.com/$env:AUDIOCPP_UPSTREAM.git" "${{ needs.setup.outputs.commit }}" upstream/audio.cpp
-      - name: Configure & build (audiocpp.dll)
+      - name: Configure & build (audiocpp.dll, ${{ matrix.backend }})
         # Large audio.cpp TUs can exceed MSVC's COFF section limit (C1128); /bigobj
         # via CXXFLAGS/CFLAGS APPENDS to (not replaces) CMake's MSVC defaults.
         env:
@@ -511,12 +580,28 @@ jobs:
           CFLAGS: /bigobj
         run: |
           $ErrorActionPreference = "Stop"
+          $extra = @()
+          if ("${{ matrix.backend }}" -eq "cuda") {
+            # NCCL is multi-GPU collective comms only and has no Windows build.
+            $extra += "-DGGML_CUDA_NCCL=OFF", "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WINDOWS"
+          }
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DAUDIOCPP_SRC="$PWD/upstream/audio.cpp" `
-            -DAUDIOCPP_BACKEND=cpu `
-            -DAUDIOCPP_MODEL_SET=full
+            -DAUDIOCPP_BACKEND=${{ matrix.backend }} `
+            -DAUDIOCPP_NATIVE_CPU=OFF `
+            -DAUDIOCPP_MODEL_SET=full @extra
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure FAILED" }
+          # A misspelt -DAUDIOCPP_NATIVE_CPU is only a CMake warning. With
+          # GGML_NATIVE on, MSVC builds probe the RUNNER's CPU and can emit
+          # AVX-512, which is an illegal instruction on most hosts.
+          if (-not (Select-String -Path build/CMakeCache.txt -Pattern '^GGML_NATIVE:BOOL=OFF$' -Quiet)) {
+            Select-String -Path build/CMakeCache.txt -Pattern 'NATIVE|GGML_AVX' | ForEach-Object { Write-Host $_.Line }
+            throw "GGML_NATIVE is not OFF: configure with -DAUDIOCPP_NATIVE_CPU=OFF"
+          }
+          Select-String -Path build/CMakeCache.txt -Pattern '^GGML_(AVX|AVX2|AVX512|FMA|F16C|BMI2)[A-Z0-9_]*:' | ForEach-Object { Write-Host $_.Line }
           cmake --build build --target audiocpp -j
+          if ($LASTEXITCODE -ne 0) { throw "cmake build FAILED" }
           $dll = Get-ChildItem -Path build -Recurse -Filter "audiocpp.dll" | Select-Object -First 1
           if (-not $dll) { throw "audiocpp.dll not found" }
           "path=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -535,10 +620,32 @@ jobs:
           if ($leaked) { Write-Host "LEAKED symbols:"; $leaked | ForEach-Object { Write-Host "  $_" }; $fail = $true }
           if ($fail) { throw "Windows symbol verification FAILED" }
           Write-Host "Windows symbol verification OK"
+      # The DLLs the library imports are what a host (or the consumer's installer)
+      # must provide next to it. Fail closed on the backend's own runtime: a
+      # Vulkan build that does not import vulkan-1.dll, or a CUDA build that does
+      # not import cudart, was silently built for the CPU.
+      - name: Report runtime dependencies
+        run: |
+          $ErrorActionPreference = "Stop"
+          $deps = & dumpbin /DEPENDENTS "${{ steps.lib.outputs.path }}" |
+            Select-String -Pattern '^\s+(\S+\.dll)\s*$' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          Write-Host "audiocpp.dll (${{ matrix.backend }}) imports:"; $deps | ForEach-Object { Write-Host "  $_" }
+          Get-Item "${{ steps.lib.outputs.path }}" | ForEach-Object { Write-Host "size: $($_.Length) bytes" }
+          $runtime = @{ cpu = @(); vulkan = @("vulkan-1.dll"); cuda = @("cudart64_13.dll", "cublas64_13.dll", "cufft64_12.dll") }
+          $want = $runtime["${{ matrix.backend }}"]
+          $missing = $want | Where-Object { $deps -notcontains $_ }
+          if ($missing) { throw "audiocpp.dll does not import: $($missing -join ', ')" }
+          $gpu = $deps | Where-Object { $_ -match '^(vulkan-1|nvcuda|cudart|cublas|cufft)' }
+          if ("${{ matrix.backend }}" -eq "cpu" -and $gpu) { throw "the CPU library imports GPU runtime DLLs: $($gpu -join ', ')" }
       - uses: actions/setup-go@v5
+        if: matrix.backend != 'cuda'
         with:
           go-version: "1.24"
+      # The runner has no GPU, so the Vulkan leg asserts the CPU device too: what
+      # it proves is that the Vulkan build's registry can be read. The CUDA
+      # library cannot be opened without the CUDA runtime and a driver.
       - name: Read the device registry through the Go binding
+        if: matrix.backend != 'cuda'
         env:
           AUDIOCPP_GO_DEVICES: "1"
           AUDIOCPP_GO_EXPECT_BACKEND: CPU
@@ -554,10 +661,12 @@ jobs:
           $stage = "stage"; New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "${{ steps.lib.outputs.path }}" $stage/
           Copy-Item upstream/audio.cpp/LICENSE "$stage/LICENSE.audio.cpp" -ErrorAction SilentlyContinue
-          tar -C $stage -czf "audiocpp-libs-windows-amd64.tar.gz" .
+          tar -C $stage -czf "${{ matrix.archive }}" .
+          Get-Item "${{ matrix.archive }}" | ForEach-Object { Write-Host "$($_.Name) $($_.Length) bytes" }
+          (Get-FileHash -Algorithm SHA256 "${{ matrix.archive }}").Hash.ToLower()
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-amd64
+          name: ${{ matrix.id }}
           path: audiocpp-libs-*.tar.gz
           if-no-files-found: error
 
