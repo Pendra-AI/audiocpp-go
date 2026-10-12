@@ -439,6 +439,11 @@ AUDIOCPP_API int audiocpp_device_memory(int index, uint64_t * free_bytes, uint64
         size_t free = 0;
         size_t total = 0;
         ggml_backend_dev_memory(device, &free, &total);
+        // Metal computes free as budget minus use in size_t, which wraps when
+        // the process is over its budget.
+        if (free > total) {
+            free = 0;
+        }
         *free_bytes = static_cast<uint64_t>(free);
         *total_bytes = static_cast<uint64_t>(total);
         return AUDIOCPP_OK;

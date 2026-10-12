@@ -48,23 +48,23 @@ type Device struct {
 	Backend string
 	// BackendIndex is the index within Backend — the value ModelParams.Device
 	// takes. For CUDA it is CUDA's own device ordinal, which is not nvidia-smi's
-	// index (CUDA orders fastest first unless CUDA_DEVICE_ORDER says otherwise).
+	// index (CUDA orders fastest first unless CUDA_DEVICE_ORDER says otherwise,
+	// and CUDA_VISIBLE_DEVICES renumbers). DeviceID names the card itself.
 	BackendIndex int
 	// Name is ggml's device handle, e.g. "CUDA0".
 	Name string
 	// Description is the hardware name, e.g. "NVIDIA GeForce RTX 4090".
 	Description string
-	// ID is the lower-case PCI bus id ("0000:01:00.0") where the backend knows
-	// it (CUDA, Vulkan), else "". It names the same card across numberings.
-	ID string
 	// Type is the device kind. CUDA reports DeviceTypeGPU for every device,
 	// shared-memory ones (DGX Spark, Jetson) included.
 	Type DeviceType
 }
 
-// Memory is a device's free and total memory in bytes, device-wide (every
-// process's use counts), as the backend reports it. Both are zero when the
-// backend has no reading.
+// Memory is a device's free and total memory in bytes, as the backend reports
+// it. CUDA reports the whole card, so every process's use counts; Metal and
+// Vulkan report this process's budget less this process's use (and Vulkan
+// reports FreeBytes == TotalBytes on a driver without VK_EXT_memory_budget).
+// Both are zero when the backend has no reading.
 type Memory struct {
 	FreeBytes  uint64
 	TotalBytes uint64
@@ -84,10 +84,7 @@ func HasDeviceAPI() bool {
 // Devices lists the devices the library can run a model on, in the library's
 // own order (Devices()[i].Index == i). The list is fixed for the life of the
 // process, so callers may cache it. Safe for concurrent use, including during a
-// Synthesize.
-//
-// The first device call initialises the engine's backends if no synthesis has
-// yet; the CUDA backend creates its context on every visible GPU at that point.
+// Synthesize. Listing does not open any device.
 func Devices() (devs []Device, err error) {
 	if !HasDeviceAPI() {
 		return nil, ErrDeviceAPIUnavailable
@@ -110,11 +107,16 @@ func Devices() (devs []Device, err error) {
 }
 
 // DeviceMemory reads the free and total memory of the device at index (a
-// Device.Index) now. It is a device-wide reading, so a model's share is the
-// drop in FreeBytes across its load and its first synthesis — the engine
-// allocates on the device at the first synthesis, not at load. The CPU device
-// reports FreeBytes == TotalBytes except on Windows, so it cannot show a drop.
+// Device.Index) now. It is not a per-model figure: a model's share is the drop
+// in FreeBytes across its load and its first synthesis — the engine allocates
+// on the device at the first synthesis, not at load. The CPU device reports
+// FreeBytes == TotalBytes except on Windows, so it cannot show a drop.
 // Safe for concurrent use, including during a Synthesize.
+//
+// Reading opens the device: on CUDA it creates this process's context on that
+// GPU if there is none yet (a few hundred MB of its memory), so read the
+// model's device rather than every device. A CUDA driver error during the read
+// aborts the process, as it does inside the engine.
 func DeviceMemory(index int) (mem Memory, err error) {
 	if !HasDeviceAPI() {
 		return Memory{}, ErrDeviceAPIUnavailable
@@ -131,10 +133,30 @@ func DeviceMemory(index int) (mem Memory, err error) {
 	return Memory{FreeBytes: free, TotalBytes: total}, nil
 }
 
+// DeviceID returns the lower-case PCI bus id ("0000:01:00.0") of the device at
+// index where the backend knows it (CUDA, ROCm, Vulkan), else "". It names the
+// same card under any tool's numbering. Like DeviceMemory it opens the device.
+func DeviceID(index int) (id string, err error) {
+	if !HasDeviceAPI() {
+		return "", ErrDeviceAPIUnavailable
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			id, err = "", fmt.Errorf("audiocpp: device query panicked across FFI: %v", r)
+		}
+	}()
+	var buf [deviceStringLen]byte
+	status := cDeviceInfo(int32(index), nil, 0, nil, nil, 0, nil, 0, &buf[0], deviceStringLen, nil)
+	if status != statusOK {
+		return "", deviceError(status, index)
+	}
+	return cBufString(buf[:]), nil
+}
+
 // ResolveDevice returns the device a model loaded with ModelParams.Backend
 // backend and ModelParams.Device device runs on, resolved the way the engine
 // resolves them ("" is "cpu"; "best" is the first GPU, else the first
-// integrated GPU, else the CPU). It needs no loaded model, so a caller can pick
+// integrated GPU, else the CPU; both ignore device). It needs no loaded model, so a caller can pick
 // the device to watch before New. An unknown backend, or a device this library
 // does not have, is an *Error with the bad-argument code.
 func ResolveDevice(backend string, device int) (dev Device, err error) {
@@ -153,23 +175,24 @@ func ResolveDevice(backend string, device int) (dev Device, err error) {
 	return deviceAt(index)
 }
 
-// Device returns the device the model runs on: ResolveDevice for the backend
-// and device it was loaded with. It does not touch the native model, so it is
-// safe during a Synthesize and after Close.
+// Device returns the device the model was loaded for: ResolveDevice for its
+// backend and device. (A model may still keep some of its parts on the CPU.) It
+// does not touch the native model, so it is safe during a Synthesize and after
+// Close.
 func (m *Model) Device() (Device, error) {
 	return ResolveDevice(m.backend, m.device)
 }
 
 func deviceAt(index int) (Device, error) {
 	var (
-		backend, name, description, id [deviceStringLen]byte
-		backendIndex, deviceType       int32
+		backend, name, description [deviceStringLen]byte
+		backendIndex, deviceType   int32
 	)
 	status := cDeviceInfo(int32(index),
 		&backend[0], deviceStringLen, &backendIndex,
 		&name[0], deviceStringLen,
 		&description[0], deviceStringLen,
-		&id[0], deviceStringLen,
+		nil, 0, // the id opens the device; see DeviceID
 		&deviceType)
 	if status != statusOK {
 		return Device{}, deviceError(status, index)
@@ -180,7 +203,6 @@ func deviceAt(index int) (Device, error) {
 		BackendIndex: int(backendIndex),
 		Name:         cBufString(name[:]),
 		Description:  cBufString(description[:]),
-		ID:           cBufString(id[:]),
 		Type:         DeviceType(deviceType),
 	}, nil
 }

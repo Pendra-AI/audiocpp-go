@@ -8,7 +8,7 @@ audio.cpp exposes no C API of its own, so this project provides one: a thin `ext
 
 - **`shim/audiocpp_c.{h,cpp}`** — the `extern "C"` surface (`audiocpp_load` / `audiocpp_synthesize` / `audiocpp_free_samples` / `audiocpp_free` / `audiocpp_version`, plus the device registry: `audiocpp_device_count` / `audiocpp_device_info` / `audiocpp_device_memory` / `audiocpp_resolve_device`). It is pointer-only, so it binds cleanly with purego. The shim wraps `make_default_registry → load → create_task_session → prepare → run → AudioBuffer`; the session is created per synthesis and keyed on task (`tts` / `voice_design` / `voice_clone`), so preset voices, voice design and cloning share one loaded model. C++ exceptions never cross the boundary — failures return a status code plus a message string.
 - **`CMakeLists.txt`** — builds audio.cpp's static `engine_runtime` and the shim into a single SHARED `libaudiocpp` with global PIC and hidden visibility, exporting only the nine `audiocpp_*` symbols (`-exported_symbols_list` on macOS, `--exclude-libs,ALL` + a version script on Linux) so nothing from ggml/sentencepiece/etc. leaks.
-- **`audiocpp.go` + `binding.go` + `library_{unix,windows}.go`** — the Go binding (package `audiocpp`): `Load(libDir)`, `New(ModelParams)`, `(*Model).Synthesize(SynthParams) → *Audio`, `Close()`, `Version()`, `EncodeWAV()`, the device registry (`Devices()`, `DeviceMemory()`, `ResolveDevice()`, `(*Model).Device()`), and a typed `Error{Code, Msg}`. purego binds the nine symbols (the four device ones are optional, so an older library still loads); native PCM is copied into Go memory and then freed, so callers never hold C-owned buffers.
+- **`audiocpp.go` + `binding.go` + `library_{unix,windows}.go`** — the Go binding (package `audiocpp`): `Load(libDir)`, `New(ModelParams)`, `(*Model).Synthesize(SynthParams) → *Audio`, `Close()`, `Version()`, `EncodeWAV()`, the device registry (`Devices()`, `DeviceMemory()`, `DeviceID()`, `ResolveDevice()`, `(*Model).Device()`), and a typed `Error{Code, Msg}`. purego binds the nine symbols (the four device ones are optional, so an older library still loads); native PCM is copied into Go memory and then freed, so callers never hold C-owned buffers.
 
 ## Usage
 
@@ -61,17 +61,27 @@ footprint := before.FreeBytes - after.FreeBytes   // guard against after > befor
 | `HasDeviceAPI() bool` | Whether the loaded library has the registry (v0.2.0 or later). |
 | `Devices() ([]Device, error)` | Every device the library can run on. Fixed for the life of the process. |
 | `DeviceMemory(index int) (Memory, error)` | `FreeBytes` and `TotalBytes` of `Devices()[index]`, read now. |
-| `ResolveDevice(backend string, device int) (Device, error)` | The device `ModelParams{Backend, Device}` runs on, without loading a model. |
+| `DeviceID(index int) (string, error)` | The device's PCI bus id (`0000:01:00.0`) on CUDA, ROCm and Vulkan, else `""`. |
+| `ResolveDevice(backend string, device int) (Device, error)` | The device `ModelParams{Backend, Device}` resolves to, without loading a model. `cpu` and `best` ignore `device`. |
 | `(*Model).Device() (Device, error)` | The same, for a loaded model. |
 
-A `Device` carries `Index` (its position in `Devices()`), `Backend` (ggml's registry name: `CUDA`, `Vulkan`, `MTL`, `ROCm`, `CPU`), `BackendIndex` (the index within that backend, which is what `ModelParams.Device` takes), `Name` (`CUDA0`), `Description` (the hardware name), `ID` (the PCI bus id, e.g. `0000:01:00.0`, on CUDA and Vulkan) and `Type` (`DeviceTypeCPU` / `GPU` / `IGPU` / `Accel` / `Meta`).
+A `Device` carries `Index` (its position in `Devices()`), `Backend` (ggml's registry name: `CUDA`, `Vulkan`, `MTL`, `ROCm`, `CPU`), `BackendIndex` (the index within that backend, which is what `ModelParams.Device` takes), `Name` (`CUDA0`), `Description` (the hardware name) and `Type` (`DeviceTypeCPU` / `GPU` / `IGPU` / `Accel` / `Meta`).
 
 Things to know when measuring with it:
 
-- **Numbering.** For CUDA, `BackendIndex` is CUDA's own device ordinal (fastest card first unless `CUDA_DEVICE_ORDER` is set), not `nvidia-smi`'s index. Use `ID` to match a device against another tool's list.
-- **It is a device reading, not a per-model sum.** `DeviceMemory` is device-wide, so a model's share is the drop in `FreeBytes` across its load and its first synthesis (the engine allocates on the device at the first synthesis, not at load). Other processes using the same device move the figure too. audio.cpp does not account its buffers per model, so the library cannot report an exact per-model byte count.
-- **What each backend reports.** CUDA reports the card's memory (on a shared-memory host such as a DGX Spark, the system's available memory) and types every device `GPU`, shared-memory ones included. Metal reports its one device. Vulkan reports each Vulkan device. The CPU device, present in every build, reports system memory with `FreeBytes == TotalBytes` (except on Windows), so it cannot show a drop; measure a CPU model by process RSS.
-- **Cost and threading.** All of these are stateless and safe to call from any goroutine, including while a `Synthesize` is running. `DeviceMemory` is one driver query; `Devices` is a handful. The first call initialises the engine's backends if nothing has yet, which on CUDA creates a context on every visible GPU: take a first reading before the window you want to measure.
+- **Numbering.** For CUDA, `BackendIndex` is CUDA's own device ordinal (fastest card first unless `CUDA_DEVICE_ORDER` is set; `CUDA_VISIBLE_DEVICES` renumbers), not `nvidia-smi`'s index. Use `DeviceID` to match a device against another tool's list.
+- **It is a device reading, not a per-model sum.** A model's share is the drop in `FreeBytes` across its load and its first synthesis (the engine allocates on the device at the first synthesis, not at load), so it covers what the model keeps afterwards, not the peak during synthesis. audio.cpp does not account its buffers per model, so the library cannot report an exact per-model byte count. `(*Model).Device()` is the device the model was loaded for; a model may still keep some parts on the CPU.
+- **What each backend reports.**
+
+  | Backend | `DeviceMemory` |
+  | --- | --- |
+  | CUDA | The whole card, so other processes move it too. On a shared-memory host (DGX Spark, Jetson) free is the system's available memory. Every device is typed `GPU`, shared-memory ones included. |
+  | Metal | This process's recommended working set less what this process has allocated. |
+  | Vulkan | This process's heap budget less its use; `FreeBytes == TotalBytes` on a driver without `VK_EXT_memory_budget`. |
+  | CPU (in every build) | System memory, with `FreeBytes == TotalBytes` except on Windows, so it cannot show a drop. Measure a CPU model by process RSS. |
+
+- **Cost.** `Devices`, `ResolveDevice` and `(*Model).Device()` only read the registry. `DeviceMemory` and `DeviceID` open the device they are asked about: on CUDA that creates this process's context on that GPU if it has none (a few hundred MB of that card), so read the model's device, not every device. Take the first reading before the window you want to measure, so the context is not counted as the model. A CUDA driver error during a read aborts the process, as it does inside the engine.
+- **Threading.** All of these are stateless and safe to call from any goroutine, including while a `Synthesize` is running.
 
 ## Building the shared library
 

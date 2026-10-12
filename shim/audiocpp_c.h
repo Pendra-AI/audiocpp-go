@@ -117,15 +117,17 @@ AUDIOCPP_API const char * audiocpp_version(void);
  * for the life of the process. All four are stateless, need no context, and are
  * safe to call from any thread, including while a synthesis is running.
  *
- * The first call initialises the ggml backends if no model has done so yet
- * (the CUDA backend creates its context on every visible GPU at that point).
+ * Listing devices does not open them. Reading a device's memory or `id` does:
+ * on CUDA that creates this process's context on that GPU if it has none yet
+ * (a few hundred MB of its memory), and a CUDA driver error there aborts the
+ * process, as it does inside the engine. So read only the devices you need.
  */
 
 /* Number of devices, or 0 when the registry cannot be read. */
 AUDIOCPP_API int audiocpp_device_count(void);
 
 /*
- * Static description of device `index`. Every out parameter is optional (NULL /
+ * Description of device `index`; it does not change while the process lives. Every out parameter is optional (NULL /
  * zero length skips it); strings are NUL-terminated and truncated to fit.
  *
  *   backend        ggml registry name: "CUDA", "Vulkan", "MTL", "ROCm", "CPU"
@@ -135,7 +137,8 @@ AUDIOCPP_API int audiocpp_device_count(void);
  *   name           ggml device handle, e.g. "CUDA0"
  *   description    hardware name, e.g. "NVIDIA GeForce RTX 4090"
  *   id             lower-case PCI bus id "domain:bus:device.function" where the
- *                  backend knows it (CUDA, Vulkan), else ""
+ *                  backend knows it (CUDA, ROCm, Vulkan), else "". Asking for
+ *                  it opens the device (see above); pass NULL to skip it.
  *   type           an audiocpp_device_type
  *
  * Returns AUDIOCPP_OK, or AUDIOCPP_ERR_BAD_ARG for an index out of range.
@@ -154,15 +157,17 @@ AUDIOCPP_API int audiocpp_device_info(int index,
 
 /*
  * Free and total memory of device `index`, in bytes, as the backend reports it
- * now (device-wide, not per process). Both are 0 when the backend has no
- * reading. Returns AUDIOCPP_OK, AUDIOCPP_ERR_BAD_ARG for a bad index or NULL
+ * now. CUDA reports the whole card (every process's use counts); Metal and
+ * Vulkan report this process's budget less this process's use. Both are 0 when
+ * the backend has no reading, and free is 0 when use exceeds the budget. Returns AUDIOCPP_OK, AUDIOCPP_ERR_BAD_ARG for a bad index or NULL
  * pointer, or AUDIOCPP_ERR_DEVICE_QUERY_FAILED.
  */
 AUDIOCPP_API int audiocpp_device_memory(int index, uint64_t * free_bytes, uint64_t * total_bytes);
 
 /*
  * The device a model loaded with (`backend`, `device`) runs on: the same
- * arguments audiocpp_load takes, resolved the way the engine resolves them.
+ * arguments audiocpp_load takes, resolved the way the engine resolves them
+ * ("cpu" and "best" ignore `device`, as the engine does).
  * Returns the device's index in the list above, or -1 when this library has no
  * such device (the load, or its first synthesis, would fail the same way).
  */

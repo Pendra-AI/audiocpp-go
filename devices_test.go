@@ -18,8 +18,18 @@ type fakeDevice struct {
 // fakeDeviceAPI swaps the device bindings for an in-memory registry shaped like
 // the shim's (global list order, per-backend indices) and marks the library
 // loaded. Everything is restored when the test ends.
-func fakeDeviceAPI(t *testing.T, devs []fakeDevice) {
+//
+// The returned map records which devices a call opened (read the memory or the
+// id of), which on CUDA costs a context on that GPU.
+func fakeDeviceAPI(t *testing.T, devs []fakeDevice) (opened map[int32]bool) {
 	t.Helper()
+	opened = map[int32]bool{}
+	var openedMu sync.Mutex
+	open := func(index int32) {
+		openedMu.Lock()
+		defer openedMu.Unlock()
+		opened[index] = true
+	}
 	prevLoaded, prevAPI := loaded, deviceAPI
 	prevCount, prevInfo, prevMem, prevResolve := cDeviceCount, cDeviceInfo, cDeviceMemory, cResolveDevice
 	t.Cleanup(func() {
@@ -57,14 +67,22 @@ func fakeDeviceAPI(t *testing.T, devs []fakeDevice) {
 		put(name, nameLen, d.name)
 		put(description, descriptionLen, d.description)
 		put(id, idLen, d.id)
-		*bi = backendIndex(int(index))
-		*deviceType = int32(d.deviceType)
+		if id != nil {
+			open(index)
+		}
+		if bi != nil {
+			*bi = backendIndex(int(index))
+		}
+		if deviceType != nil {
+			*deviceType = int32(d.deviceType)
+		}
 		return statusOK
 	}
 	cDeviceMemory = func(index int32, free, total *uint64) int32 {
 		if index < 0 || int(index) >= len(devs) {
 			return statusBadArg
 		}
+		open(index)
 		*free, *total = devs[index].free, devs[index].total
 		return statusOK
 	}
@@ -81,6 +99,7 @@ func fakeDeviceAPI(t *testing.T, devs []fakeDevice) {
 		return -1
 	}
 	loaded, deviceAPI = true, true
+	return opened
 }
 
 // twoGPUHost is a two-card CUDA host as the library sees it: CUDA orders the
@@ -104,9 +123,9 @@ func TestDevices_ListsTheRegistryInOrder(t *testing.T) {
 		t.Fatalf("Devices: %v", err)
 	}
 	want := []Device{
-		{Index: 0, Backend: "CUDA", BackendIndex: 0, Name: "CUDA0", Description: "NVIDIA GeForce RTX 4090", ID: "0000:41:00.0", Type: DeviceTypeGPU},
-		{Index: 1, Backend: "CUDA", BackendIndex: 1, Name: "CUDA1", Description: "NVIDIA GeForce RTX 3060", ID: "0000:01:00.0", Type: DeviceTypeGPU},
-		{Index: 2, Backend: "CPU", BackendIndex: 0, Name: "CPU", Description: "AMD Ryzen 9", ID: "", Type: DeviceTypeCPU},
+		{Index: 0, Backend: "CUDA", BackendIndex: 0, Name: "CUDA0", Description: "NVIDIA GeForce RTX 4090", Type: DeviceTypeGPU},
+		{Index: 1, Backend: "CUDA", BackendIndex: 1, Name: "CUDA1", Description: "NVIDIA GeForce RTX 3060", Type: DeviceTypeGPU},
+		{Index: 2, Backend: "CPU", BackendIndex: 0, Name: "CPU", Description: "AMD Ryzen 9", Type: DeviceTypeCPU},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("Devices() returned %d devices, want %d: %+v", len(got), len(want), got)
@@ -115,6 +134,42 @@ func TestDevices_ListsTheRegistryInOrder(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("Devices()[%d] = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+// Listing devices and resolving a model's device must not open a GPU the model
+// is not on: on CUDA each opened card costs the process a context there.
+func TestDeviceAPI_OpensOnlyTheDeviceAskedFor(t *testing.T) {
+	opened := fakeDeviceAPI(t, twoGPUHost())
+
+	if _, err := Devices(); err != nil {
+		t.Fatalf("Devices: %v", err)
+	}
+	dev, err := (&Model{backend: "cuda", device: 1}).Device()
+	if err != nil {
+		t.Fatalf("Model.Device: %v", err)
+	}
+	if len(opened) != 0 {
+		t.Fatalf("listing and resolving opened devices %v", opened)
+	}
+
+	if _, err := DeviceMemory(dev.Index); err != nil {
+		t.Fatalf("DeviceMemory: %v", err)
+	}
+	id, err := DeviceID(dev.Index)
+	if err != nil || id != "0000:01:00.0" {
+		t.Fatalf("DeviceID(%d) = %q, %v; want 0000:01:00.0", dev.Index, id, err)
+	}
+	if len(opened) != 1 || !opened[1] {
+		t.Errorf("reading CUDA1 opened %v, want only device 1", opened)
+	}
+
+	if id, err := DeviceID(2); err != nil || id != "" {
+		t.Errorf("DeviceID of the CPU device = %q, %v; want empty", id, err)
+	}
+	var e *Error
+	if _, err := DeviceID(7); !errors.As(err, &e) || e.Code != statusBadArg {
+		t.Errorf("DeviceID(7) error = %v, want a bad-argument *Error", err)
 	}
 }
 
@@ -199,6 +254,9 @@ func TestDeviceAPI_UnavailableOnAnOlderLibrary(t *testing.T) {
 	}
 	if _, err := DeviceMemory(0); !errors.Is(err, ErrDeviceAPIUnavailable) {
 		t.Errorf("DeviceMemory() error = %v, want ErrDeviceAPIUnavailable", err)
+	}
+	if _, err := DeviceID(0); !errors.Is(err, ErrDeviceAPIUnavailable) {
+		t.Errorf("DeviceID() error = %v, want ErrDeviceAPIUnavailable", err)
 	}
 	if _, err := ResolveDevice("cuda", 0); !errors.Is(err, ErrDeviceAPIUnavailable) {
 		t.Errorf("ResolveDevice() error = %v, want ErrDeviceAPIUnavailable", err)
@@ -316,8 +374,12 @@ func TestDeviceRegistryIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DeviceMemory(%d): %v", d.Index, err)
 		}
+		id, err := DeviceID(d.Index)
+		if err != nil {
+			t.Fatalf("DeviceID(%d): %v", d.Index, err)
+		}
 		t.Logf("device %d: backend=%s[%d] name=%q description=%q id=%q type=%s free=%d total=%d",
-			d.Index, d.Backend, d.BackendIndex, d.Name, d.Description, d.ID, d.Type, mem.FreeBytes, mem.TotalBytes)
+			d.Index, d.Backend, d.BackendIndex, d.Name, d.Description, id, d.Type, mem.FreeBytes, mem.TotalBytes)
 		if d.Index != i {
 			t.Errorf("Devices()[%d].Index = %d", i, d.Index)
 		}
@@ -346,8 +408,12 @@ func TestDeviceRegistryIntegration(t *testing.T) {
 	if got != *expected {
 		t.Errorf("ResolveDevice(%q, 0) = %+v, want %+v", resolve, got, *expected)
 	}
-	if _, err := ResolveDevice(resolve, 99); err == nil {
-		t.Errorf("ResolveDevice(%q, 99) succeeded", resolve)
+	// The CPU backend has one device and the engine ignores the index for it.
+	if _, err := ResolveDevice(resolve, 99); (err == nil) != (resolve == "cpu") {
+		t.Errorf("ResolveDevice(%q, 99) error = %v", resolve, err)
+	}
+	if _, err := ResolveDevice("no-such-backend", 0); err == nil {
+		t.Error("ResolveDevice with an unknown backend succeeded")
 	}
 	if _, err := DeviceMemory(len(devs)); err == nil {
 		t.Error("DeviceMemory past the end of the list succeeded")
