@@ -92,6 +92,15 @@ set_target_properties(audiocpp PROPERTIES
   VISIBILITY_INLINES_HIDDEN ON
   OUTPUT_NAME audiocpp)
 
+# cuFFT is used only by audio.cpp's CUDA inverse STFT, which most model families
+# (qwen3_tts among them) never call, and cufft64_12.dll is about 280 MB. Delay-load
+# it on Windows so the library opens without it: a host then needs the DLL only
+# for a model that reaches that code.
+if(MSVC AND AUDIOCPP_BACKEND STREQUAL "cuda")
+  target_link_options(audiocpp PRIVATE "/DELAYLOAD:cufft64_12.dll")
+  target_link_libraries(audiocpp PRIVATE delayimp)
+endif()
+
 # Belt-and-braces symbol hiding of everything pulled from the static libs.
 if(APPLE)
   target_link_options(audiocpp PRIVATE
